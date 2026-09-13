@@ -288,6 +288,11 @@ func authenticateCore(ctx context.Context, connection *os.File, token string) er
 	}()
 	select {
 	case err := <-result:
+		if err == nil {
+			// Authentication's deadline must not expire the long-lived RPC
+			// transport that takes ownership of this connection next.
+			return connection.SetReadDeadline(time.Time{})
+		}
 		return err
 	case <-ctx.Done():
 		_ = connection.Close()

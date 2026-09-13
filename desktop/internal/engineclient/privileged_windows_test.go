@@ -61,7 +61,7 @@ func TestAuthenticatedPipeAcceptsExpectedProcessAndToken(t *testing.T) {
 	_ = result.file.Close()
 }
 
-func TestAuthenticatedPipeSupportsConcurrentProtocolTraffic(t *testing.T) {
+func TestAuthenticatedPipeSupportsConcurrentProtocolTrafficAfterAuthDeadline(t *testing.T) {
 	pipe, err := createAuthenticatedPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +101,12 @@ func TestAuthenticatedPipeSupportsConcurrentProtocolTraffic(t *testing.T) {
 	}
 	host := result.file
 	defer host.Close()
+
+	// The authentication context belongs only to the handshake. The returned
+	// connection must still carry bidirectional RPC traffic after it expires.
+	<-ctx.Done()
+	trafficCtx, trafficCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer trafficCancel()
 
 	hostReply := make(chan error, 1)
 	readStarted := make(chan struct{})
@@ -143,8 +149,8 @@ func TestAuthenticatedPipeSupportsConcurrentProtocolTraffic(t *testing.T) {
 			if err != nil {
 				t.Fatalf("%s failed: %v", label, err)
 			}
-		case <-ctx.Done():
-			t.Fatalf("%s blocked: %v", label, ctx.Err())
+		case <-trafficCtx.Done():
+			t.Fatalf("%s blocked: %v", label, trafficCtx.Err())
 		}
 	}
 }
