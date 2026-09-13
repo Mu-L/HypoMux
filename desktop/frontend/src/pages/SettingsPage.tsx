@@ -14,11 +14,7 @@ import {
   Switch,
   Tab,
   TabList,
-  Toast,
-  ToastBody,
-  ToastTitle,
   useId,
-  useToastController,
 } from "@fluentui/react-components";
 import {
   ArrowSync20Regular,
@@ -29,11 +25,13 @@ import {
 } from "@fluentui/react-icons";
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import { GlassSurface } from "../components/material/GlassSurface";
-import { AppToaster } from "../components/AppToaster";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
 import { desktopPlatform } from "../platform/desktop";
 import { appServices, type AdapterView, type CompleteAppSettings, type ConfigMigrationStatus } from "../platform/services";
 import { SettingsSaveQueue, type SaveOutcome } from "../platform/settingsQueue";
 import { adapterListKey } from "../state/adapterRuntime";
+import { SYSTEM_PROXY_TAKEOVER_EVENT } from "../state/systemProxyTakeover";
+import { ADAPTER_VISIBILITY_EVENT } from "../state/adapterVisibility";
 import { accentColours } from "../theme/appearance.presets";
 import { useAppearance } from "../theme/appearance.store";
 import { backgroundService } from "../theme/background.service";
@@ -41,18 +39,23 @@ import type { AccentPreset, AppearanceMode, MotionMode, PanelMaterial, WindowMat
 import { useI18n } from "../i18n/i18n";
 
 const emptySettings: CompleteAppSettings = {
+  steam_cdn_enabled: false,
   mode: "tun",
   language: "zh",
   socks_port: 10800,
   http_port: 10801,
+  system_proxy_takeover: true,
   weighted: false,
   strict_route: true,
+  tun_stack: "system",
   force_tun_connectivity_bypass: false,
   blocked_domain_bypass: false,
   blocked_domain_expiry: true,
   close_to_tray: false,
+  hide_virtual_adapters: true,
   autostart: false,
   auto_start_engine: false,
+  auto_connect_wifi: false,
   dns_server: "223.5.5.5",
   dns_policy: "auto",
   dns_egress_mode: "auto",
@@ -293,6 +296,18 @@ export function SettingsPage({
     saveQueue.attach((updater) => setSettings(updater));
   }, [saveQueue]);
 
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent(SYSTEM_PROXY_TAKEOVER_EVENT, {
+      detail: settings.system_proxy_takeover,
+    }));
+  }, [settings.system_proxy_takeover]);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent(ADAPTER_VISIBILITY_EVENT, {
+      detail: settings.hide_virtual_adapters ?? true,
+    }));
+  }, [settings.hide_virtual_adapters]);
+
   const enqueueSave = <T,>(operation: () => Promise<SaveOutcome<T, CompleteAppSettings>>, fields: string[] | null): Promise<T> =>
     saveQueue.enqueue(operation, fields).catch((error) => {
       // Errors are already surfaced via notify inside the operation; the
@@ -302,18 +317,11 @@ export function SettingsPage({
       return undefined as T;
     });
 
-  const toasterId = useId("settings-toaster");
-  const { dispatchToast } = useToastController(toasterId);
+  const { notify: pushNotification } = useAppNotifications();
 
   const notify = useCallback((title: string, body: string, intent: "success" | "error" | "info" | "warning" = "success") => {
-    dispatchToast(
-      <Toast>
-        <ToastTitle>{title}</ToastTitle>
-        <ToastBody>{body}</ToastBody>
-      </Toast>,
-      { intent, timeout: 2800 },
-    );
-  }, [dispatchToast]);
+    pushNotification({ title, message: body, intent, dedupeKey: `settings:${intent}:${title}` });
+  }, [pushNotification]);
 
   useEffect(() => {
     if (appearancePersistenceError) {
@@ -520,7 +528,6 @@ export function SettingsPage({
 
   return (
     <main ref={settingsPageRef} className="settings-page" aria-busy={loading || saving}>
-      <AppToaster toasterId={toasterId} position="top-end" />
       <header className="page-heading">
         <div>
           <span className="section-kicker">{text("偏好设置", "HypoMux preferences")}</span>
@@ -739,6 +746,13 @@ export function SettingsPage({
               }}
             />
           </SettingRow>
+          <SettingRow title={text("首页隐藏虚拟网卡", "Hide virtual adapters on Home")} description={text(
+            "默认隐藏 VMware、Hyper-V 等虚拟网卡。关闭后显示全部网卡；已有网卡选择保持不变。",
+            "Hide virtual adapters such as VMware and Hyper-V by default. Turn off to show all adapters. Existing selections are preserved.",
+          )}>
+            <SettingSwitch checked={settings.hide_virtual_adapters ?? true} disabled={loading || saving}
+              onChange={(checked) => patchAndSave({ hide_virtual_adapters: checked })} />
+          </SettingRow>
           <SettingRow title={t("settings_close_behavior")} description={text(
             "关闭主窗口时隐藏到托盘，或直接退出并恢复运行状态",
             "Hide the main window to the tray, or exit and restore the active network state.",
@@ -761,6 +775,18 @@ export function SettingsPage({
               <label>SOCKS5 <Input type="number" min={1} max={65534} value={String(settings.socks_port)} onChange={(_, data) => setSettings((current) => ({ ...current, socks_port: Number(data.value) }))} /></label>
               <label>HTTP <Input type="number" min={1} max={65534} value={String(settings.http_port)} onChange={(_, data) => setSettings((current) => ({ ...current, http_port: Number(data.value) }))} /></label>
             </div>
+          </SettingRow>
+          <SettingRow title={t("settings_system_proxy_takeover")} description={t("settings_system_proxy_takeover_hint")}>
+            <SettingSwitch
+              checked={settings.system_proxy_takeover}
+              disabled={loading || saving}
+              onChange={(checked) => void patchAndSave(
+                { system_proxy_takeover: checked },
+                checked
+                  ? t("settings_system_proxy_takeover_on")
+                  : t("settings_system_proxy_takeover_off"),
+              )}
+            />
           </SettingRow>
         </GlassSurface>
 
@@ -815,6 +841,36 @@ export function SettingsPage({
         <GlassSurface className="settings-section" id="settings-advanced">
           <h2>{t("settings_advanced_network")}</h2>
           <SettingRow
+            title={text("TUN 协议栈", "TUN stack")}
+            description={text(
+              "System 使用系统协议栈；Mixed 使用系统 TCP + gVisor UDP；gVisor 使用完整用户态协议栈。遇到兼容性问题时可切换尝试，保存后下次启动 TUN 生效。",
+              "System uses the OS stack; Mixed uses system TCP + gVisor UDP; gVisor uses a full userspace stack. Try another stack for compatibility issues. Applies the next time TUN starts.",
+            )}
+          >
+            <SettingDropdown
+              value={settings.tun_stack || "system"}
+              disabled={loading || saving}
+              options={[
+                { value: "system", label: text("System（默认）", "System (default)") },
+                { value: "mixed", label: text("Mixed（混合）", "Mixed (hybrid)") },
+                { value: "gvisor", label: text("gVisor（用户态）", "gVisor (userspace)") },
+              ]}
+              onChange={(value) => void patchAndSave(
+                { tun_stack: value },
+                text("TUN 协议栈已保存，下次启动 TUN 生效", "TUN stack saved; applies the next time TUN starts"),
+              )}
+            />
+          </SettingRow>
+          <SettingRow
+            title={text("FakeIP 与规则集缓存", "FakeIP and rule-set cache")}
+            description={text(
+              "已自动启用持久化缓存，保留 FakeIP 映射；远程规则集接入后也可复用。缓存位于配置目录下的 cache/sing-box.db，不随 TUN 重启清除。",
+              "Persistent caching is enabled automatically for FakeIP mappings and future remote rule sets. Stored at cache/sing-box.db inside the configuration directory and retained across TUN restarts.",
+            )}
+          >
+            <span>{text("已启用", "Enabled")}</span>
+          </SettingRow>
+          <SettingRow
             title={t("settings_force_tun")}
             description={t("settings_force_tun_hint")}
             danger
@@ -848,6 +904,16 @@ export function SettingsPage({
               checked={settings.auto_start_engine}
               disabled={saving || !settings.autostart}
               onChange={(checked) => setAutoStartEngine(checked)}
+            />
+          </SettingRow>
+          <SettingRow title={text("开机自动连接 Wi-Fi", "Connect Wi-Fi at startup")} description={text(
+            "自动加速前，为已选无线网卡连接 Windows 中已保存且允许自动连接的网络，最多等待 2 分钟。关闭后停止主动连接，已连接的 Wi-Fi 保持连接。",
+            "Before automatic acceleration, connect selected Wi-Fi adapters using saved Windows networks that allow automatic connection. Wait up to 2 minutes. Turning this off stops connection requests and keeps existing connections.",
+          )}>
+            <SettingSwitch
+              checked={settings.auto_connect_wifi ?? false}
+              disabled={saving || !settings.autostart || !settings.auto_start_engine}
+              onChange={(checked) => patchAndSave({ auto_connect_wifi: checked })}
             />
           </SettingRow>
           <SettingRow title={t("settings_config_path")} description={configPath || text("正在读取配置文件位置…", "Reading configuration path…")}>

@@ -1,9 +1,12 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { PropsWithChildren, ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppNotificationProvider } from "../components/notifications/AppNotifications";
 import type { HomeAdapter } from "../state/useEngineState";
 import { HomePage } from "./HomePage";
+import { dismissStartupWarningsToday, startupWarningsDismissedToday } from "../state/startupWarningReminder";
 
 const mocks = vi.hoisted(() => ({
   useEngineState: vi.fn(),
@@ -25,6 +28,12 @@ vi.mock("../i18n/i18n", () => ({
     })[key] ?? key,
   }),
 }));
+
+const NotificationTestProvider = ({ children }: PropsWithChildren) => (
+  <AppNotificationProvider>{children}</AppNotificationProvider>
+);
+
+const renderPage = (ui: ReactElement) => render(ui, { wrapper: NotificationTestProvider });
 
 const adapter: HomeAdapter = {
   id: "Ethernet",
@@ -52,7 +61,11 @@ const engineState = () => ({
   phase: "stopped",
   mode: "proxy",
   weighted: false,
+  systemProxyTakeover: true,
   adapters: [adapter],
+  visibleAdapters: [adapter],
+  hiddenAdapterCount: 0,
+  hiddenSelectedCount: 0,
   selected: [adapter],
   totalWeight: adapter.weight,
   history: Array.from({ length: 18 }, () => 0),
@@ -79,6 +92,7 @@ const engineState = () => ({
 
 describe("HomePage adapter interactions", () => {
   beforeEach(() => {
+    localStorage.clear();
     mocks.useEngineState.mockReturnValue(engineState());
   });
 
@@ -87,9 +101,47 @@ describe("HomePage adapter interactions", () => {
     vi.clearAllMocks();
   });
 
+  it("switches strategies and only exposes weights for weighted scheduling", () => {
+    const state = engineState();
+    mocks.useEngineState.mockReturnValue(state);
+    const { rerender } = renderPage(<HomePage />);
+    const selector = screen.getByRole("combobox", { name: "Scheduling strategy" });
+    expect(selector.textContent).toContain("Maximum speed first");
+    expect(screen.queryByRole("textbox", { name: "Ethernet Weight" })).toBeNull();
+    fireEvent.click(selector);
+    fireEvent.click(screen.getByRole("option", { name: "Schedule by weight" }));
+    expect(state.setWeighted).toHaveBeenLastCalledWith(true);
+    mocks.useEngineState.mockReturnValue({ ...state, weighted: true });
+    rerender(<HomePage />);
+    expect((screen.getByRole("textbox", { name: "Ethernet Weight" }) as HTMLInputElement).value).toBe("3");
+    fireEvent.click(screen.getByRole("button", { name: "Increase Ethernet Weight" }));
+    expect(state.updateWeight).toHaveBeenCalledWith("Ethernet", 4);
+    fireEvent.click(selector);
+    fireEvent.click(screen.getByRole("option", { name: "Maximum speed first" }));
+    expect(state.setWeighted).toHaveBeenLastCalledWith(false);
+  });
+
+  it.each(["starting", "running", "degraded", "stopping"])("locks the strategy while %s", (phase) => {
+    mocks.useEngineState.mockReturnValue({ ...engineState(), phase, transitioning: phase === "starting" || phase === "stopping" });
+    renderPage(<HomePage />);
+    expect((screen.getByRole("combobox", { name: "Scheduling strategy" }) as HTMLSelectElement).disabled).toBe(true);
+  });
+
+  it("explains hidden adapters and keeps the shared runtime list complete", () => {
+    const virtual = { ...adapter, id: "vmware", name: "VMware", is_virtual: true };
+    mocks.useEngineState.mockReturnValue({ ...engineState(), adapters: [virtual], selected: [virtual], visibleAdapters: [], hiddenAdapterCount: 1, hiddenSelectedCount: 1 });
+    const onAdapterRuntimeChange = vi.fn();
+    renderPage(<HomePage onAdapterRuntimeChange={onAdapterRuntimeChange} />);
+    expect(screen.getByText("All active adapters are hidden")).toBeTruthy();
+    expect(screen.getByText(/1 virtual adapter\(s\) hidden, including 1 selected/)).toBeTruthy();
+    expect(screen.queryByRole("article")).toBeNull();
+    expect((screen.getByRole("button", { name: "Select all" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(onAdapterRuntimeChange).toHaveBeenCalledWith([virtual]);
+  });
+
   it("opens active connections for the clicked adapter", () => {
     const onNavigate = vi.fn();
-    render(<HomePage onNavigate={onNavigate} />);
+    renderPage(<HomePage onNavigate={onNavigate} />);
 
     fireEvent.click(screen.getByRole("button", { name: "View active connections for Ethernet" }));
 
@@ -102,12 +154,13 @@ describe("HomePage adapter interactions", () => {
     const inactiveEngine = {
       ...engineState(),
       adapters: [inactiveAdapter],
+      visibleAdapters: [inactiveAdapter],
       selected: [],
       totalWeight: 0,
     };
     mocks.useEngineState.mockReturnValue(inactiveEngine);
     const onNavigate = vi.fn();
-    render(<HomePage onNavigate={onNavigate} />);
+    renderPage(<HomePage onNavigate={onNavigate} />);
 
     fireEvent.click(screen.getByRole("button", { name: "View active connections for Ethernet" }));
     fireEvent.click(screen.getByRole("article"));
@@ -117,8 +170,9 @@ describe("HomePage adapter interactions", () => {
   });
 
   it("keeps adapter controls from triggering connection navigation", () => {
+    mocks.useEngineState.mockReturnValue({ ...engineState(), weighted: true });
     const onNavigate = vi.fn();
-    render(<HomePage onNavigate={onNavigate} />);
+    renderPage(<HomePage onNavigate={onNavigate} />);
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Disable Ethernet" }));
     fireEvent.click(screen.getByRole("button", { name: "Increase Ethernet Weight" }));
@@ -126,11 +180,18 @@ describe("HomePage adapter interactions", () => {
     expect(onNavigate).not.toHaveBeenCalled();
   });
 
+  it("makes local-port-only proxy mode explicit", () => {
+    mocks.useEngineState.mockReturnValue({ ...engineState(), systemProxyTakeover: false });
+    renderPage(<HomePage />);
+
+    expect(screen.getByText(/Local proxy ports only; Windows system proxy is unchanged/)).not.toBeNull();
+  });
+
   it("publishes adapter readiness and engine phase to the shared runtime feed", () => {
     const onAdapterRuntimeChange = vi.fn();
     const onEnginePhaseChange = vi.fn();
     mocks.useEngineState.mockReturnValue({ ...engineState(), loading: true, phase: "starting" });
-    const { rerender } = render(
+    const { rerender } = renderPage(
       <HomePage
         onAdapterRuntimeChange={onAdapterRuntimeChange}
         onEnginePhaseChange={onEnginePhaseChange}
@@ -150,5 +211,57 @@ describe("HomePage adapter interactions", () => {
 
     expect(onAdapterRuntimeChange).toHaveBeenLastCalledWith([]);
     expect(onEnginePhaseChange).toHaveBeenLastCalledWith("stopped");
+  });
+
+  const warningSnapshot = {
+    ready: true,
+    issues: [{ code: "foreign_network_risk", level: "warning", title: "Third-party network risk", detail: "Test risk" }],
+  };
+  const preflight = () => mocks.useEngineState.mock.calls[mocks.useEngineState.mock.calls.length - 1][1];
+
+  it("remembers the checkbox only after Continue and suppresses warnings after remount", async () => {
+    const page = renderPage(<HomePage />);
+    let result: Promise<boolean>;
+    act(() => { result = preflight()(warningSnapshot); });
+    expect(screen.getByText("Startup risks detected")).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Don't remind me again today" }));
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await expect(result!).resolves.toBe(true);
+    expect(startupWarningsDismissedToday()).toBe(true);
+    page.unmount();
+    renderPage(<HomePage />);
+    await act(async () => {
+      expect(await preflight()(warningSnapshot)).toBe(true);
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("does not remember the checkbox when the user goes back", async () => {
+    renderPage(<HomePage />);
+    let result: Promise<boolean>;
+    act(() => { result = preflight()(warningSnapshot); });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Don't remind me again today" }));
+    fireEvent.click(screen.getByRole("button", { name: "Go back" }));
+    await expect(result!).resolves.toBe(false);
+    expect(startupWarningsDismissedToday()).toBe(false);
+    act(() => { result = preflight()(warningSnapshot); });
+    expect(screen.getByRole<HTMLInputElement>("checkbox", { name: "Don't remind me again today" }).checked).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await expect(result!).resolves.toBe(true);
+    expect(startupWarningsDismissedToday()).toBe(false);
+  });
+
+  it("still shows blockers and disables Continue even when today's warnings are muted", async () => {
+    dismissStartupWarningsToday();
+    renderPage(<HomePage />);
+    let result: Promise<boolean>;
+    act(() => {
+      result = preflight()({ ready: false, issues: [{ code: "missing_core", level: "blocker", title: "Missing core", detail: "Test" }] });
+    });
+    expect(screen.getByText("Virtual NIC cannot start yet")).toBeTruthy();
+    expect(screen.queryByRole("checkbox", { name: "Don't remind me again today" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Go back" }));
+    await expect(result!).resolves.toBe(false);
   });
 });

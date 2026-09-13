@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Badge,
   Button,
+  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -9,13 +10,7 @@ import {
   DialogSurface,
   DialogTitle,
   Spinner,
-  Toast,
-  ToastBody,
-  ToastFooter,
-  ToastTitle,
   Tooltip,
-  useId,
-  useToastController,
 } from "@fluentui/react-components";
 import {
   ArrowSync20Regular,
@@ -31,7 +26,8 @@ import { RuntimeStatusBar } from "../components/home/RuntimeStatusBar";
 import type { AppPage } from "../components/shell/CompactNavigation";
 import type { TunPreflightSnapshot } from "../platform/services";
 import { useI18n } from "../i18n/i18n";
-import { AppToaster } from "../components/AppToaster";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
+import { canDismissStartupWarnings, dismissStartupWarningsToday, startupWarningsDismissedToday } from "../state/startupWarningReminder";
 
 const formatBytes = (value: number) => {
   if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`;
@@ -54,39 +50,43 @@ export function HomePage({
   const [preflightDialog, setPreflightDialog] = useState<TunPreflightSnapshot | null>(null);
   const [preflightDialogOpen, setPreflightDialogOpen] = useState(false);
   const [showPreflightDetails, setShowPreflightDetails] = useState(false);
+  const [dismissWarningsToday, setDismissWarningsToday] = useState(false);
   const preflightResolver = useRef<((confirmed: boolean) => void) | null>(null);
-  const toasterId = useId("hypomux-toaster");
-  const { dispatchToast } = useToastController(toasterId);
+  const { notify } = useAppNotifications();
   const notifyError = useCallback((message: string, retry?: () => void) => {
     const informational = message.includes("Steam") || message.startsWith("提示：");
-    dispatchToast(
-      <Toast>
-        <ToastTitle>{informational ? t("infobar_info") : text("操作未完成", "Operation not completed")}</ToastTitle>
-        <ToastBody>{message}</ToastBody>
-        {retry && (
-          <ToastFooter>
-            <Button appearance="transparent" onClick={retry}>{text("重试", "Retry")}</Button>
-          </ToastFooter>
-        )}
-      </Toast>,
-      { intent: "error", timeout: 6000 },
-    );
-  }, [dispatchToast, locale, t]);
+    notify({
+      title: informational ? t("infobar_info") : text("操作未完成", "Operation not completed"),
+      message,
+      intent: informational ? "info" : "error",
+      action: retry ? { label: text("重试", "Retry"), onClick: retry } : undefined,
+      dedupeKey: informational ? "home:engine-info" : "home:engine-error",
+    });
+  }, [locale, notify, t]);
   const handleTunPreflight = useCallback((snapshot: TunPreflightSnapshot) => {
+    if (canDismissStartupWarnings(snapshot) && startupWarningsDismissedToday()) {
+      return Promise.resolve(true);
+    }
     return new Promise<boolean>((resolve) => {
       preflightResolver.current?.(false);
       preflightResolver.current = resolve;
       setShowPreflightDetails(false);
+      setDismissWarningsToday(false);
       setPreflightDialog(snapshot);
       setPreflightDialogOpen(true);
     });
   }, []);
   const closeTunPreflight = useCallback((confirmed: boolean) => {
+    if (confirmed && dismissWarningsToday && preflightDialog && canDismissStartupWarnings(preflightDialog)) {
+      if (!dismissStartupWarningsToday()) {
+        notifyError(text("无法保存今日免提醒设置，本次仍将继续启动。", "Could not save today's reminder preference. Startup will still continue."));
+      }
+    }
     const resolve = preflightResolver.current;
     preflightResolver.current = null;
     setPreflightDialogOpen(false);
     resolve?.(confirmed);
-  }, []);
+  }, [dismissWarningsToday, preflightDialog, notifyError, locale]);
   useEffect(() => () => preflightResolver.current?.(false), []);
   const engine = useEngineState(notifyError, handleTunPreflight);
   useEffect(
@@ -94,13 +94,42 @@ export function HomePage({
     [engine.adapters, engine.loading, onAdapterRuntimeChange],
   );
   useEffect(() => onEnginePhaseChange?.(engine.phase), [engine.phase, onEnginePhaseChange]);
+  const previousEnginePhase = useRef<EnginePhase>();
+  useEffect(() => {
+    const previous = previousEnginePhase.current;
+    previousEnginePhase.current = engine.phase;
+    if (previous === "starting" && engine.phase === "running") {
+      notify({
+        title: text("加速已启动", "Acceleration started"),
+        message: text(
+          `${engine.selected.length} 条链路已加入${engine.mode === "tun" ? "虚拟网卡" : "系统代理"}加速。`,
+          `${engine.selected.length} link(s) joined ${engine.mode === "tun" ? "Virtual NIC" : "System Proxy"} acceleration.`,
+        ),
+        intent: "success",
+        dedupeKey: "home:engine-started",
+      });
+    } else if (previous === "stopping" && engine.phase === "stopped") {
+      notify({
+        title: text("加速已停止", "Acceleration stopped"),
+        message: text("系统网络设置已安全恢复。", "System network settings were restored safely."),
+        intent: "info",
+        dedupeKey: "home:engine-stopped",
+      });
+    } else if (previous === "running" && engine.phase === "degraded") {
+      notify({
+        title: text("加速链路状态波动", "Acceleration link degraded"),
+        message: text("部分链路暂时不可用，正在自动调整流量。", "Some links are unavailable; traffic is being adjusted automatically."),
+        intent: "warning",
+        dedupeKey: "home:engine-degraded",
+      });
+    }
+  }, [engine.mode, engine.phase, engine.selected.length, locale, notify]);
   const preflightIssues = preflightDialog?.issues ?? [];
   const blockerCount = preflightIssues.filter((issue) => issue.level === "blocker").length;
   const warningCount = preflightIssues.filter((issue) => issue.level === "warning").length;
 
   return (
     <main className="home-page">
-      <AppToaster toasterId={toasterId} position="top-end" />
       <EngineHero
         phase={engine.phase}
         mode={engine.mode}
@@ -113,6 +142,7 @@ export function HomePage({
         weighted={engine.weighted}
         socksPort={engine.ports.socks}
         httpPort={engine.ports.http}
+        systemProxyTakeover={engine.systemProxyTakeover}
         onModeChange={engine.setMode}
         onWeightedChange={engine.setWeighted}
         onToggle={engine.toggleEngine}
@@ -125,12 +155,12 @@ export function HomePage({
             <h1 id="network-section-title">{text("网络适配器", "Network adapters")}</h1>
           </div>
           <div className="network-section-actions">
-            <span>{engine.selected.length} / {engine.adapters.length} {text("已启用", "enabled")}</span>
+            <span>{engine.visibleAdapters.filter((adapter) => adapter.selected).length} / {engine.visibleAdapters.length} {text("已启用", "enabled")}</span>
             <Button
               size="small"
               appearance="subtle"
               icon={<CheckmarkCircle20Regular />}
-              disabled={engine.loading || engine.transitioning || engine.adapters.length === 0}
+              disabled={engine.loading || engine.transitioning || engine.visibleAdapters.length === 0}
               onClick={() => engine.selectAll(true)}
             >
               {t("home_select_all")}
@@ -139,7 +169,7 @@ export function HomePage({
               size="small"
               appearance="subtle"
               icon={<Dismiss20Regular />}
-              disabled={engine.loading || engine.transitioning || engine.selected.length === 0}
+              disabled={engine.loading || engine.transitioning || !engine.visibleAdapters.some((adapter) => adapter.selected)}
               onClick={() => engine.selectAll(false)}
             >
               {t("home_deselect_all")}
@@ -155,13 +185,23 @@ export function HomePage({
             </Button>
           </div>
         </div>
+        {engine.hiddenAdapterCount > 0 && (
+          <p className="section-kicker">
+            {text(
+              `已隐藏 ${engine.hiddenAdapterCount} 张虚拟网卡${engine.hiddenSelectedCount ? `，其中 ${engine.hiddenSelectedCount} 张已选中` : ""}。可在设置中关闭“首页隐藏虚拟网卡”以显示。`,
+              `${engine.hiddenAdapterCount} virtual adapter(s) hidden${engine.hiddenSelectedCount ? `, including ${engine.hiddenSelectedCount} selected` : ""}. Turn off “Hide virtual adapters on Home” in Settings to show them.`,
+            )}
+          </p>
+        )}
         <div className="network-adapter-list">
           {engine.loading ? (
             <div className="adapter-empty hm-card"><Spinner label={text("正在扫描活动网络适配器", "Scanning active network adapters")} /></div>
-          ) : engine.adapters.length === 0 ? (
+          ) : engine.visibleAdapters.length === 0 ? (
             <div className="adapter-empty hm-card">
-              <strong>{text("未发现可参与聚合的活动网卡", "No active adapters can participate in aggregation")}</strong>
-              <span>{text(
+              <strong>{engine.hiddenAdapterCount > 0
+                ? text("当前活动网卡均已隐藏", "All active adapters are hidden")
+                : text("未发现可参与聚合的活动网卡", "No active adapters can participate in aggregation")}</strong>
+              <span>{engine.hiddenAdapterCount > 0 ? text("请在设置中关闭“首页隐藏虚拟网卡”以查看和选择。", "Turn off “Hide virtual adapters on Home” in Settings to view and select adapters.") : text(
                 "请检查网卡是否已连接并具有可用 IPv4 地址，然后重新扫描。",
                 "Check that an adapter is connected and has a usable IPv4 address, then scan again.",
               )}</span>
@@ -169,12 +209,13 @@ export function HomePage({
                 {t("home_refresh_tip")}
               </Button>
             </div>
-          ) : engine.adapters.map((adapter) => (
+          ) : engine.visibleAdapters.map((adapter) => (
             <NetworkAdapterItem
               key={adapter.id}
               adapter={adapter}
+              weighted={engine.weighted}
               percentage={adapter.selected ? Math.round((adapter.weight / engine.totalWeight) * 100) || 0 : 0}
-              disabled={engine.transitioning || engine.phase === "running"}
+              disabled={engine.transitioning || engine.phase === "running" || engine.phase === "degraded"}
               onOpenConnections={() => onNavigate?.("connections", adapter.name)}
               onSelectedChange={(checked) => engine.toggleAdapter(adapter.id, checked)}
               onWeightChange={(value) => engine.updateWeight(adapter.id, value)}
@@ -251,6 +292,19 @@ export function HomePage({
                       </div>
                     ))}
                   </div>
+                  {canDismissStartupWarnings(preflightDialog) && (
+                    <div>
+                      <Checkbox
+                        checked={dismissWarningsToday}
+                        onChange={(_, data) => setDismissWarningsToday(data.checked === true)}
+                        label={text("今日内不再提醒", "Don't remind me again today")}
+                      />
+                      <p className="tun-preflight-reminder-hint">{text(
+                        "勾选并点击“继续”后，今日不再弹出启动风险提示；明日自动恢复。启动检查和阻断性错误不受影响。",
+                        "Check this and choose Continue to hide startup risk prompts for today. Reminders return tomorrow; startup checks and blocking errors remain enabled.",
+                      )}</p>
+                    </div>
+                  )}
                 </div>
               )}
             </DialogContent>

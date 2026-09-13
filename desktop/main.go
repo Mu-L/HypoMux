@@ -3,10 +3,14 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Hypostasis-Cat/HypoMux/desktop/internal/engineclient"
@@ -121,7 +125,7 @@ func main() {
 			"HypoMux - 配置加载失败",
 			fmt.Sprintf(
 				"无法安全加载设置文件：\n%s\n\n%v\n\n为避免覆盖现有配置，HypoMux 已停止启动。请备份并修复或重命名该文件后重试。",
-				settingsService.ConfigPath(),
+				settingsService.StartupErrorPath(),
 				err,
 			),
 		)
@@ -184,12 +188,34 @@ func main() {
 			startupSettings := settingsService.Get()
 			if shouldAutoStartAcceleration(startSilent, startupSettings) {
 				go func() {
+					waitCtx, waitCancel := context.WithTimeout(
+						context.Background(),
+						autoStartAdapterWaitTimeout,
+					)
+					defer waitCancel()
+					wifi := startup.NewWiFiConnector()
+					desktop.SetEngineTrayStatus("waiting_network", startupSettings.Mode)
 					if err := runAutoStartAcceleration(
+						waitCtx,
 						startupSettings,
+						func(ctx context.Context) error {
+							return waitForSelectedAdapters(
+								ctx,
+								startupSettings.SelectedAdapterIDs,
+								autoStartAdapterPollInterval,
+								adapterService.List,
+								func(ctx context.Context) error {
+									return prepareBootWiFi(ctx, startupSettings, settingsService.Get(), wifi.TryConnect)
+								},
+							)
+						},
 						engineService.Start,
 						desktop.SetEngineTrayStatus,
 					); err != nil {
-						log.Printf("auto-start HypoMux acceleration: %v", err)
+						if !errors.Is(err, context.Canceled) {
+							log.Printf("auto-start HypoMux acceleration: %v", err)
+							supportLogs.RecordEvent("auto_start", "failed", map[string]any{"reason": err.Error()})
+						}
 					}
 				}()
 			}
@@ -233,11 +259,31 @@ func shouldAutoStartAcceleration(startSilent bool, settings services.AppSettings
 	return startSilent && settings.Autostart && settings.AutoStartEngine
 }
 
+const (
+	autoStartAdapterPollInterval = 2 * time.Second
+	autoStartAdapterWaitTimeout  = 2 * time.Minute
+)
+
 func runAutoStartAcceleration(
+	ctx context.Context,
 	settings services.AppSettings,
+	waitUntilReady func(context.Context) error,
 	start func(string) (services.EngineSnapshot, error),
 	setStatus func(string, string),
 ) error {
+	if waitUntilReady != nil {
+		if err := waitUntilReady(ctx); err != nil {
+			if errors.Is(err, context.Canceled) {
+				setStatus("stopped", settings.Mode)
+			} else {
+				setStatus("failed", settings.Mode)
+			}
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	setStatus("starting", settings.Mode)
 	snapshot, err := start(settings.Mode)
 	if err != nil {
@@ -246,6 +292,86 @@ func runAutoStartAcceleration(
 	}
 	setStatus(snapshot.Phase, snapshot.Mode)
 	return nil
+}
+
+// Re-read preferences while waiting: disabling startup or changing its inputs
+// cancels this boot attempt instead of starting an obsolete configuration.
+func prepareBootWiFi(ctx context.Context, expected, current services.AppSettings, connect func(context.Context, []string) error) error {
+	if !shouldAutoStartAcceleration(true, current) || current.Mode != expected.Mode || !slices.Equal(current.SelectedAdapterIDs, expected.SelectedAdapterIDs) {
+		return context.Canceled
+	}
+	if !current.AutoConnectWiFi {
+		return nil
+	}
+	return connect(ctx, current.SelectedAdapterIDs)
+}
+
+func waitForSelectedAdapters(
+	ctx context.Context,
+	selectedIDs []string,
+	pollInterval time.Duration,
+	list func() ([]services.AdapterView, error),
+	prepare ...func(context.Context) error,
+) error {
+	wanted := make(map[string]struct{}, len(selectedIDs))
+	for _, id := range selectedIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	if pollInterval <= 0 {
+		pollInterval = autoStartAdapterPollInterval
+	}
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	missing := make([]string, 0, len(wanted))
+	var lastListErr, lastWiFiErr error
+	for {
+		for _, request := range prepare {
+			if err := request(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return err
+				}
+				lastWiFiErr = err
+			}
+		}
+		adapters, err := list()
+		if err == nil {
+			lastListErr = nil
+			available := make(map[string]struct{}, len(adapters))
+			for _, adapter := range adapters {
+				available[adapter.ID] = struct{}{}
+			}
+			missing = missing[:0]
+			for id := range wanted {
+				if _, ok := available[id]; !ok {
+					missing = append(missing, id)
+				}
+			}
+			if len(missing) == 0 {
+				return nil
+			}
+			sort.Strings(missing)
+		} else {
+			lastListErr = err
+		}
+
+		select {
+		case <-ctx.Done():
+			if lastListErr != nil {
+				return fmt.Errorf("等待开机网卡就绪失败：%v：%w", lastListErr, ctx.Err())
+			}
+			if lastWiFiErr != nil {
+				return fmt.Errorf("等待开机网卡就绪超时（缺少：%s）；最近的 Wi-Fi 连接提示：%v：%w", strings.Join(missing, "、"), lastWiFiErr, ctx.Err())
+			}
+			return fmt.Errorf("等待开机网卡就绪超时（缺少：%s）；请检查网线、Wi-Fi 自动连接和 DHCP：%w", strings.Join(missing, "、"), ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func hasArgument(arguments []string, expected string) bool {

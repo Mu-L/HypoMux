@@ -7,14 +7,14 @@ import * as TunService from "../../bindings/github.com/Hypostasis-Cat/HypoMux/de
 import { Call } from "@wailsio/runtime";
 import type {
   AppSettings,
-  AdapterView,
+  AdapterView as GeneratedAdapterView,
   DiagnosticResult,
   DiagnosticSnapshot,
   EngineSnapshot,
   RunningProcess,
   RoutingBatchPreview,
   RoutingRule,
-  RoutingSnapshot,
+  RoutingSnapshot as GeneratedRoutingSnapshot,
   RoutingValidation,
   SupportLogSession,
   SupportLogSnapshot,
@@ -23,14 +23,12 @@ import type {
 } from "../../bindings/github.com/Hypostasis-Cat/HypoMux/desktop/internal/services/models";
 
 export type {
-  AdapterView,
   DiagnosticResult,
   DiagnosticSnapshot,
   EngineSnapshot,
   RunningProcess,
   RoutingBatchPreview,
   RoutingRule,
-  RoutingSnapshot,
   RoutingValidation,
   SupportLogSession,
   SupportLogSnapshot,
@@ -38,13 +36,33 @@ export type {
   TunPreflightSnapshot,
 };
 
+export type RoutingSnapshot = Omit<GeneratedRoutingSnapshot, "match_order"> & { match_order?: string[] | null };
+
+export type AdapterView = GeneratedAdapterView & { is_virtual?: boolean };
+
 export type CompleteAppSettings = AppSettings & {
+  steam_cdn_enabled?: boolean;
+  hide_virtual_adapters?: boolean;
+  tun_stack: string;
   language: "zh" | "en";
   force_tun_connectivity_bypass: boolean;
   blocked_domain_bypass: boolean;
   blocked_domain_expiry: boolean;
   autostart: boolean;
   auto_start_engine: boolean;
+  auto_connect_wifi?: boolean;
+};
+
+export type SteamCDNStatus = {
+
+ speed_probe_bytes?: number; speed_probe_limit?: number;
+ core_version?: string; core_commit?: string; configured_mode?: string;
+ accounting_version?: number; started_at?: string; sampled_at?: string; switched_bytes?: number; original_bytes?: number; transfer_failures?: number;
+ stage_counts?: Record<string,number>; effective_replacements?: number;
+ recognized?: number;
+ diagnostics?: Array<{domain: string; adapter: string; ip: string; stage: string; at: string}>;
+ available: boolean; enabled: boolean; probing: number; replacements: number; fallbacks: number;
+ entries: Array<{probe_bps?: number; probed_at?: string; admission_reason?: string; source?: string; evaluated_at?: string; switched_bytes?: number; original_bytes?: number; switched_bps?: number; switched_active?: number; transfer_failures?: number; decision_reason?: string; validated?: boolean; preferred?: boolean; total_bps?: number; active_connections?: number; successful_connections?: number; effective_bytes?: number; adapter: string; domain: string; port: string; ip: string; download_bps: number; samples: number; selections: number; cooldown_until: string; expires_at: string}>;
 };
 
 export type BlockedDomainEntry = {
@@ -113,6 +131,7 @@ export type ConnectionView = {
 
 export type ConnectionListSnapshot = {
   phase: string;
+  mode: string;
   sampled_at: string;
   connections: ConnectionView[];
 };
@@ -212,6 +231,8 @@ export const appServices = {
       AdapterService.SaveSelection(mode, weighted, adapters),
   },
   engine: {
+    steamCDNStatus: (reset = false) => Call.ByName(engineMethod("SteamCDNStatus"), reset) as Promise<SteamCDNStatus>,
+    setSteamCDNEnabled: (enabled: boolean) => Call.ByName(engineMethod("SetSteamCDNEnabled"), enabled) as Promise<CompleteAppSettings>,
     snapshot: () => EngineService.Snapshot(),
     connections: () =>
       Call.ByName(engineMethod("Connections")) as Promise<ConnectionListSnapshot>,
@@ -223,16 +244,16 @@ export const appServices = {
       ) as Promise<WFPRepairResult>,
   },
   routing: {
-    snapshot: () => RoutingRuleService.Snapshot(),
+    snapshot: () => RoutingRuleService.Snapshot() as Promise<RoutingSnapshot>,
     validate: (rule: RoutingRule, existing: RoutingRule[]) =>
       RoutingRuleService.Validate(rule, existing),
     previewBatch: (matchType: string, values: string[], outbound: string, existing: RoutingRule[]) =>
       RoutingRuleService.PreviewBatch(matchType, values, outbound, existing),
-    save: (rules: RoutingRule[]) => RoutingRuleService.Save(rules),
+    save: (rules: RoutingRule[], order: string[] = ["process", "domain", "ip"]) => Call.ByName("github.com/Hypostasis-Cat/HypoMux/desktop/internal/services.RoutingRuleService.SaveOrdered", rules, order) as Promise<RoutingSnapshot>,
     listProcesses: () => RoutingRuleService.ListProcesses(),
     listProcessChoices: () => RoutingRuleService.ListProcessChoices(),
     importRules: () => RoutingRuleService.Import(),
-    exportRules: (rules: RoutingRule[]) => RoutingRuleService.Export(rules),
+    exportRules: (rules: RoutingRule[], order: string[] = ["process", "domain", "ip"]) => Call.ByName("github.com/Hypostasis-Cat/HypoMux/desktop/internal/services.RoutingRuleService.ExportOrdered", rules, order) as Promise<string>,
   },
   diagnostics: {
     latest: () => DiagnosticsService.Latest(),

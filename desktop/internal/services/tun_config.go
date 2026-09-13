@@ -32,25 +32,16 @@ type dnsResolveResult struct {
 }
 
 type tunConfigOptions struct {
+	IPv4Address   string
+	Stack         string
 	DNSPolicy     string
 	IPv6Available bool
 	ConfigName    string
 	ClashAPI      *clashAPIConfig
 	ConfigSHA256  *string
-}
-
-func singBoxRouteRule(rule RoutingRule) map[string]any {
-	entry := map[string]any{"outbound": rule.Outbound}
-	switch rule.MatchType {
-	case MatchProcess:
-		entry["process_name"] = []string{rule.Value}
-	case MatchDomain:
-		entry["domain"] = []string{rule.Value}
-		entry["domain_suffix"] = []string{"." + strings.TrimPrefix(rule.Value, ".")}
-	case MatchIP:
-		entry["ip_cidr"] = []string{rule.Value}
-	}
-	return entry
+	// Executable is used by compatibility tests; production resolves the
+	// bundled runtime asset through the trusted installation layout.
+	Executable string
 }
 
 func writeSingBoxConfig(
@@ -79,6 +70,10 @@ func writeSingBoxConfigWithOptions(
 	strictRoute bool,
 	options tunConfigOptions,
 ) (string, string, clashAPIConfig, error) {
+	stack, err := normalizeTunStack(options.Stack)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
 	ethernetPort, err := loopbackPort(endpoints, "nic_ethernet")
 	if err != nil {
 		return "", "", clashAPIConfig{}, err
@@ -101,7 +96,14 @@ func writeSingBoxConfigWithOptions(
 			return "", "", clashAPIConfig{}, err
 		}
 	}
-	singBox, err := resolveRuntimeAsset("sing-box.exe")
+	singBox := strings.TrimSpace(options.Executable)
+	if singBox == "" {
+		singBox, err = resolveRuntimeAsset("sing-box.exe")
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	dnsMode, err := singBoxTunDNSMode(singBox, dnsPolicy)
 	if err != nil {
 		return "", "", clashAPIConfig{}, err
 	}
@@ -123,7 +125,17 @@ func writeSingBoxConfigWithOptions(
 			processPaths = append(processPaths, absolute)
 		}
 	}
-	compatibilityPaths := append([]string(nil), compatibility.ProcessPaths...)
+	ruleSetOutbounds := []string{"nic_ethernet", "nic_wifi", "aggregation", "direct"}
+	for name := range endpoints {
+		if strings.HasPrefix(name, "nic_") {
+			ruleSetOutbounds = append(ruleSetOutbounds, name)
+		}
+	}
+	usesFakeIP := tunDNSNeedsFakeIP(dnsPolicy, rules)
+	ruleSetPlan, err := writeSingBoxRuleSetPlan(rules, ruleSetOutbounds, usesFakeIP)
+	if err != nil {
+		return "", "", clashAPIConfig{}, err
+	}
 	routeRules := []any{
 		map[string]any{"action": "sniff", "timeout": "300ms"},
 		map[string]any{"process_path": processPaths, "outbound": "system-direct"},
@@ -132,40 +144,19 @@ func writeSingBoxConfigWithOptions(
 			"outbound":     "system-direct",
 		},
 	}
-	// A user may deliberately pin an upstream proxy server to a hotspot or
-	// another selected adapter. Match that literal destination before the
-	// third-party proxy compatibility fallback, otherwise the process-name
-	// bypass would silently force the connection back to the system default
-	// route. The rule is repeated after DNS resolution below so regular TUN
-	// traffic still retains FakeIP-aware CIDR matching.
-	for _, rule := range rules {
-		if rule.MatchType == MatchIP && strings.HasPrefix(rule.Outbound, "nic_") {
-			routeRules = append(routeRules, singBoxRouteRule(rule))
-		}
-	}
-	if len(compatibilityPaths) > 0 {
-		routeRules = append(routeRules, map[string]any{
-			"process_path": compatibilityPaths, "outbound": "system-direct",
-		})
-	}
-	if len(compatibility.ProcessNames) > 0 {
-		routeRules = append(routeRules, map[string]any{
-			"process_name": compatibility.ProcessNames, "outbound": "system-direct",
-		})
-	}
 	if dnsPolicy != "system" {
 		routeRules = append(routeRules,
 			map[string]any{"port": []int{53}, "action": "hijack-dns"},
 			map[string]any{"protocol": []string{"dns"}, "action": "hijack-dns"},
+		)
+	}
+	routeRules = append(routeRules, singBoxCompatibilityRouteRules(compatibility, ruleSetPlan)...)
+	if dnsPolicy != "system" {
+		routeRules = append(routeRules,
 			map[string]any{"action": "resolve", "server": "dns-local", "strategy": "prefer_ipv4"},
 		)
 	}
-	for _, rule := range rules {
-		if rule.MatchType != MatchProcess && rule.MatchType != MatchDomain && rule.MatchType != MatchIP {
-			continue
-		}
-		routeRules = append(routeRules, singBoxRouteRule(rule))
-	}
+	routeRules = append(routeRules, ruleSetPlan.UserRouteRules...)
 	directOutbound := map[string]any{"type": "direct", "tag": "direct"}
 	if directPort, directErr := loopbackPort(endpoints, "direct"); directErr == nil {
 		directOutbound = socksOutbound("direct", directPort)
@@ -189,7 +180,6 @@ func writeSingBoxConfigWithOptions(
 		_ = endpoint
 		outbounds = append(outbounds, socksOutbound(name, port))
 	}
-	usesFakeIP := tunDNSNeedsFakeIP(dnsPolicy, rules)
 	dnsServers := []any{upstream}
 	dnsConfig := map[string]any{
 		"servers": dnsServers,
@@ -207,17 +197,39 @@ func writeSingBoxConfigWithOptions(
 		}
 		dnsConfig["reverse_mapping"] = true
 	}
-	address := []string{"172.19.0.1/30"}
+	ipv4Address := options.IPv4Address
+	if ipv4Address == "" {
+		ipv4Address, err = availableTunIPv4Address()
+		if err != nil {
+			return "", "", clashAPIConfig{}, err
+		}
+	}
+	address := []string{ipv4Address}
 	if options.IPv6Available {
 		address = append(address, "fdfe:dcba:9876::1/126")
 	}
 	tunInbound := map[string]any{
 		"type": "tun", "tag": "tun-in", "interface_name": "HypoMux-Tun",
 		"address": address,
-		"mtu":     1492, "auto_route": true, "strict_route": strictRoute, "stack": "system",
+		"mtu":     1492, "auto_route": true, "strict_route": strictRoute, "stack": stack,
+	}
+	if dnsMode != "" {
+		tunInbound["dns_mode"] = dnsMode
 	}
 	if exclusions := dnsBootstrapRouteExclusions(dnsResult); len(exclusions) > 0 && dnsPolicy != "system" {
 		tunInbound["route_exclude_address"] = exclusions
+	}
+	// Keep the database outside runtime: config staging, IPv4 fallback and
+	// sidecar restarts must all reuse the same persistent FakeIP/rule-set store.
+	cacheDirectory := filepath.Join(settingsDirectory(), "cache")
+	if err := os.MkdirAll(cacheDirectory, 0o700); err != nil {
+		return "", "", clashAPIConfig{}, fmt.Errorf("创建 sing-box 缓存目录失败：%w", err)
+	}
+	cacheConfig := map[string]any{
+		"enabled": true, "path": filepath.Join(cacheDirectory, "sing-box.db"),
+	}
+	if usesFakeIP {
+		cacheConfig["store_fakeip"] = true
 	}
 	config := map[string]any{
 		"log":       map[string]any{"level": "warn", "timestamp": true},
@@ -227,8 +239,10 @@ func writeSingBoxConfigWithOptions(
 		"route": map[string]any{
 			"auto_detect_interface": true, "default_domain_resolver": "dns-local",
 			"find_process": true, "final": "aggregation", "rules": routeRules,
+			"rule_set": ruleSetPlan.Definitions,
 		},
 		"experimental": map[string]any{
+			"cache_file": cacheConfig,
 			"clash_api": map[string]any{
 				"external_controller": clashAPI.Endpoint,
 				"secret":              clashAPI.Secret,
@@ -260,6 +274,39 @@ func writeSingBoxConfigWithOptions(
 		return "", "", clashAPIConfig{}, fmt.Errorf("提交 TUN 配置失败：%w", err)
 	}
 	return singBox, path, clashAPI, nil
+}
+
+// Adapter IP overrides are an exception for known third-party proxy processes,
+// never a global IP priority layer. Both overrides and the compatibility bypass
+// yield to explicit process/domain rules, including rules added by hot reload.
+// DNS interception is placed before this block by the caller.
+func singBoxCompatibilityRouteRules(compatibility compatibilityPlan, plan singBoxRuleSetPlan) []any {
+	processes := []any{}
+	if len(compatibility.ProcessPaths) > 0 {
+		processes = append(processes, map[string]any{"process_path": compatibility.ProcessPaths})
+	}
+	if len(compatibility.ProcessNames) > 0 {
+		processes = append(processes, map[string]any{"process_name": compatibility.ProcessNames})
+	}
+	if len(processes) == 0 {
+		return nil
+	}
+	guard := []any{map[string]any{"type": "logical", "mode": "or", "rules": processes}}
+	if len(plan.PriorityRuleSets) > 0 {
+		guard = append(guard, map[string]any{"rule_set": plan.PriorityRuleSets, "invert": true})
+	}
+	result := []any{}
+	for _, raw := range plan.EarlyRouteRules {
+		reference := raw.(map[string]any)
+		conditions := append([]any{}, guard...)
+		conditions = append(conditions, map[string]any{"rule_set": reference["rule_set"]})
+		result = append(result, map[string]any{
+			"type": "logical", "mode": "and", "rules": conditions, "outbound": reference["outbound"],
+		})
+	}
+	return append(result, map[string]any{
+		"type": "logical", "mode": "and", "rules": guard, "outbound": "system-direct",
+	})
 }
 
 func reserveClashAPI() (clashAPIConfig, error) {
@@ -309,6 +356,18 @@ func normalizeTunDNSPolicy(value string) string {
 		return "auto"
 	}
 	return value
+}
+
+func normalizeTunStack(value string) (string, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch value {
+	case "":
+		return "system", nil
+	case "system", "mixed", "gvisor":
+		return value, nil
+	default:
+		return "", fmt.Errorf("不支持的 TUN 协议栈：%s（可选 system、mixed、gvisor）", value)
+	}
 }
 
 func buildDNSUpstreamForPolicy(
@@ -378,7 +437,7 @@ func tunDNSNeedsFakeIP(policy string, rules []RoutingRule) bool {
 		return true
 	}
 	for _, rule := range rules {
-		if rule.MatchType == MatchDomain {
+		if !rule.Disabled && rule.MatchType == MatchDomain {
 			return true
 		}
 	}

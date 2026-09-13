@@ -23,20 +23,16 @@ import {
   Option,
   SearchBox,
   Spinner,
+  Switch,
   Tab,
   TabList,
   Textarea,
-  Toast,
-  ToastBody,
-  ToastTitle,
   Toolbar,
   ToolbarButton,
-  useId,
-  useToastController,
   type TableColumnDefinition,
   type TableRowId,
 } from "@fluentui/react-components";
-import { AppToaster } from "../components/AppToaster";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
 import {
   Add20Regular,
   AppGeneric20Regular,
@@ -58,8 +54,11 @@ import {
   ROUTING_BATCH_MAX_VALUES,
   routingRuleIdentity,
 } from "./routingBatch";
+import { routingApplyState } from "./routingEffect";
 
 type MatchType = "process" | "domain" | "ip";
+const matchOrders = ["process,domain,ip", "process,ip,domain", "domain,process,ip", "domain,ip,process", "ip,process,domain", "ip,domain,process"];
+const normalizeOrder = (order?: string[] | null) => matchOrders.includes(order?.join(",") ?? "") ? order!.join(",") : matchOrders[0];
 type DraftRule = RoutingRule & {
   id: string;
   error?: string;
@@ -72,7 +71,11 @@ const newID = () => globalThis.crypto?.randomUUID?.() ?? `rule-${Date.now()}-${M
 export const makeDrafts = (rules: RoutingRule[]): DraftRule[] =>
   rules.map((rule) => ({ ...rule, id: newID() }));
 
-const ruleKey = (rule: RoutingRule) => `${rule.match_type}\u0000${rule.value}\u0000${rule.outbound}`;
+const serializeRule = ({ match_type, value, outbound, disabled, priority }: RoutingRule): RoutingRule => ({
+  match_type, value, outbound, ...(disabled ? { disabled } : {}), ...(priority ? { priority } : {}),
+});
+
+const ruleKey = (rule: RoutingRule) => `${rule.match_type}\u0000${rule.value}\u0000${rule.outbound}\u0000${!!rule.disabled}\u0000${rule.priority ?? 0}`;
 
 export const reconcileSavedDrafts = (saved: RoutingRule[], submitted: DraftRule[]): DraftRule[] => {
   const available = new Map<string, DraftRule[]>();
@@ -112,6 +115,7 @@ const browserRoutingFixture = (): RoutingSnapshot | null => {
         outbound: index % 4 === 0 ? "direct" : index % 4 === 1 ? "nic_以太网" : "aggregation",
       };
     }),
+    restart_required: false,
   };
 };
 
@@ -142,6 +146,8 @@ export function RoutingPage() {
     domain: t("routing_placeholder_domain"),
     ip: t("routing_placeholder_ip"),
   }), [t]);
+  const [matchOrder, setMatchOrder] = useState(matchOrders[0]);
+  const orderRef = useRef(matchOrders[0]);
   const [rules, setRules] = useState<DraftRule[]>([]);
   const [outbounds, setOutbounds] = useState<RoutingSnapshot["outbounds"]>([]);
   const [activeType, setActiveType] = useState<MatchType>("process");
@@ -151,9 +157,11 @@ export function RoutingPage() {
   const [newOutbound, setNewOutbound] = useState("aggregation");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [checkingOutbounds, setCheckingOutbounds] = useState(false);
   const [savedAt, setSavedAt] = useState("");
   const [pendingSave, setPendingSave] = useState(false);
-  const [engineRunningInTun, setEngineRunningInTun] = useState(false);
+  const [engineRuntime, setEngineRuntime] = useState({ phase: "stopped", mode: "tun" });
+  const [restartRequirement, setRestartRequirement] = useState({ required: false, reason: "" });
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [processOpen, setProcessOpen] = useState(false);
   const [processes, setProcesses] = useState<RunningProcess[]>([]);
@@ -176,35 +184,62 @@ export function RoutingPage() {
   const autosaveTimer = useRef<number>();
   const validationSequence = useRef(new Map<string, number>());
   const validationTimers = useRef(new Map<string, number>());
-  const saveQueue = useRef<LatestSaveQueue<RoutingRule[], RoutingSnapshot>>();
+  const saveQueue = useRef<LatestSaveQueue<{ rules: RoutingRule[]; order: string[] }, RoutingSnapshot>>();
   if (!saveQueue.current) {
-    saveQueue.current = new LatestSaveQueue((next) => appServices.routing.save(next));
+    saveQueue.current = new LatestSaveQueue((next) => appServices.routing.save(next.rules, next.order));
   }
   const addRuleInputRef = useRef<HTMLInputElement>(null);
-  const toasterId = useId("routing-toaster");
-  const { dispatchToast } = useToastController(toasterId);
+  const { notify: pushNotification } = useAppNotifications();
 
-  const notify = useCallback((title: string, message: string, intent: "success" | "error" | "info" = "info") => {
-    dispatchToast(
-      <Toast>
-        <ToastTitle>{title}</ToastTitle>
-        <ToastBody>{message}</ToastBody>
-      </Toast>,
-      { intent, timeout: intent === "error" ? 6000 : 2600 },
-    );
-  }, [dispatchToast]);
+  const notify = useCallback((title: string, message: string, intent: "success" | "error" | "warning" | "info" = "info") => {
+    pushNotification({ title, message, intent, dedupeKey: `routing:${intent}:${title}` });
+  }, [pushNotification]);
+
+  const applyResult = useCallback((snapshot: RoutingSnapshot) => {
+    setRestartRequirement({
+      required: snapshot.restart_required,
+      reason: snapshot.restart_reason ?? "",
+    });
+    const state = routingApplyState(snapshot, engineRuntime.phase, engineRuntime.mode);
+    if (state === "hot_reloaded") {
+      return {
+        message: text("已有连接保持当前路径，新连接立即使用新规则。", "Existing connections keep their current path; new connections use the updated rules immediately."),
+        intent: "success" as const,
+      };
+    }
+    if (state === "restart_required") {
+      return {
+        message: snapshot.restart_reason === "enable_fakeip"
+          ? text("规则已保存。请重启聚合以启用域名分流所需的 DNS 配置。", "Rules were saved. Restart aggregation to enable the DNS configuration required for domain routing.")
+          : text("规则已保存。请重启聚合以完整加载这项更改。", "Rules were saved. Restart aggregation to load this change completely."),
+        intent: "warning" as const,
+      };
+    }
+    if (state === "inactive_mode") {
+      return {
+        message: text("规则已保存，但仅由 TUN 模式加载；当前系统代理流量不会切换出口。", "Rules were saved but are loaded only in TUN mode; current system-proxy traffic will not switch egress."),
+        intent: "info" as const,
+      };
+    }
+    return {
+      message: text("规则已保存，将在下次启动 TUN 模式时生效。", "Rules were saved and will take effect the next time TUN mode starts."),
+      intent: "info" as const,
+    };
+  }, [engineRuntime.mode, engineRuntime.phase, text]);
 
   const load = useCallback(async () => {
     setLoading(true);
     const engineTask = appServices.engine.snapshot()
       .then((engine) => {
-        setEngineRunningInTun(engine.phase === "running" && engine.mode === "tun");
+        setEngineRuntime({ phase: engine.phase, mode: engine.mode });
       })
       .catch(() => undefined);
     try {
       const snapshot = await appServices.routing.snapshot();
+      orderRef.current = normalizeOrder(snapshot.match_order);
+      setMatchOrder(orderRef.current);
       const available = new Set((snapshot.outbounds ?? []).map((outbound) => outbound.id));
-      const nextRules = makeDrafts(snapshot.rules ?? []).map((rule) => available.has(rule.outbound)
+      const nextRules = makeDrafts(snapshot.rules ?? []).map((rule) => rule.disabled || available.has(rule.outbound)
         ? rule
         : {
             ...rule,
@@ -216,6 +251,7 @@ export function RoutingPage() {
       rulesRef.current = nextRules;
       setRules(nextRules);
       setOutbounds(snapshot.outbounds ?? []);
+      setRestartRequirement({ required: snapshot.restart_required, reason: snapshot.restart_reason ?? "" });
       setPendingSave(false);
       setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       loaded.current = true;
@@ -259,9 +295,12 @@ export function RoutingPage() {
     const sequence = (validationSequence.current.get(draft.id) ?? 0) + 1;
     validationSequence.current.set(draft.id, sequence);
     try {
+      if (!Number.isInteger(draft.priority ?? 0) || (draft.priority ?? 0) < 0 || (draft.priority ?? 0) > 999) {
+        throw new Error(text("优先级必须是 0–999 的整数", "Priority must be an integer from 0 to 999"));
+      }
       const currentRules = rulesRef.current
         .filter((item) => item.id !== draft.id)
-        .map(({ match_type, value, outbound }) => ({ match_type, value, outbound }));
+        .map(serializeRule);
       const result = await appServices.routing.validate(draft, currentRules);
       if (validationSequence.current.get(draft.id) !== sequence) return;
       const next = rulesRef.current.map((item) =>
@@ -277,9 +316,10 @@ export function RoutingPage() {
           : item);
       applyRules(next);
     }
-  }, [applyRules]);
+  }, [applyRules, text]);
 
   const updateRule = useCallback((id: string, patch: Partial<RoutingRule>) => {
+    validationSequence.current.set(id, (validationSequence.current.get(id) ?? 0) + 1);
     let nextDraft: DraftRule | undefined;
     const next = rulesRef.current.map((item) => {
       if (item.id !== id) return item;
@@ -315,7 +355,7 @@ export function RoutingPage() {
     setSaving(true);
     const queue = saveQueue.current!;
     const handle = queue.enqueue(
-      submitted.map(({ match_type, value, outbound }) => ({ match_type, value, outbound })),
+      { rules: submitted.map(serializeRule), order: orderRef.current.split(",") },
     );
     try {
       const snapshot = await handle.done;
@@ -323,15 +363,13 @@ export function RoutingPage() {
       const savedRules = reconcileSavedDrafts(snapshot.rules ?? [], submitted);
       applyRules(savedRules);
       setOutbounds(snapshot.outbounds ?? []);
+      const applied = applyResult(snapshot);
       setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setPendingSave(false);
       if (showToast) notify(
         text("规则已保存", "Rules saved"),
-        text(
-          `已持久化 ${snapshot.rules?.length ?? 0} 条分流规则`,
-          `${snapshot.rules?.length ?? 0} routing rules were persisted`,
-        ),
-        "success",
+        applied.message,
+        applied.intent,
       );
       return true;
     } catch (error) {
@@ -342,7 +380,7 @@ export function RoutingPage() {
     } finally {
       if (queue.isCurrent(handle.revision)) setSaving(false);
     }
-  }, [applyRules, notify, text]);
+  }, [applyResult, applyRules, notify, text]);
 
   useEffect(() => {
     if (!loaded.current || !pendingSave || rules.some((rule) => rule.validating || rule.error)) {
@@ -371,7 +409,7 @@ export function RoutingPage() {
     };
     const result = await appServices.routing.validate(
       candidate,
-      rulesRef.current.map(({ match_type, value: itemValue, outbound }) => ({ match_type, value: itemValue, outbound })),
+      rulesRef.current.map(serializeRule),
     );
     if (!result.valid) {
       notify(
@@ -427,22 +465,22 @@ export function RoutingPage() {
     setSaving(true);
     const queue = saveQueue.current!;
     const importedEditRevision = editRevision.current;
-    const handle = queue.enqueue(importPreview.rules ?? []);
+    const handle = queue.enqueue({ rules: importPreview.rules ?? [], order: normalizeOrder(importPreview.match_order).split(",") });
     try {
       const saved = await handle.done;
       if (!queue.isCurrent(handle.revision) || importedEditRevision !== editRevision.current) return;
       applyRules(reconcileSavedDrafts(saved.rules ?? [], imported));
       setOutbounds(saved.outbounds ?? []);
+      orderRef.current = normalizeOrder(saved.match_order ?? orderRef.current.split(","));
+      setMatchOrder(orderRef.current);
+      const applied = applyResult(saved);
       setImportPreviewOpen(false);
       setSelected(new Set());
       setPendingSave(false);
       notify(
         text("导入完成", "Import complete"),
-        text(
-          `已原子替换为 ${saved.rules?.length ?? 0} 条规则`,
-          `Atomically replaced the current list with ${saved.rules?.length ?? 0} rules`,
-        ),
-        "success",
+        applied.message,
+        applied.intent,
       );
     } catch (error) {
       if (queue.isCurrent(handle.revision) && importedEditRevision === editRevision.current) {
@@ -452,7 +490,7 @@ export function RoutingPage() {
     } finally {
       if (queue.isCurrent(handle.revision)) setSaving(false);
     }
-  }, [applyRules, importPreview, notify, text]);
+  }, [applyResult, applyRules, importPreview, notify, text]);
 
   const openBatch = useCallback(() => {
     setBatchType(activeType);
@@ -483,7 +521,7 @@ export function RoutingPage() {
         batchType,
         values,
         batchOutbound,
-        rulesRef.current.map(({ match_type, value, outbound }) => ({ match_type, value, outbound })),
+        rulesRef.current.map(serializeRule),
       );
       setBatchPreview({ ...preview, items: preview.items ?? [] });
     } catch (error) {
@@ -532,12 +570,15 @@ export function RoutingPage() {
     setBatchApplying(true);
     const queue = saveQueue.current!;
     const batchEditRevision = editRevision.current;
-    const handle = queue.enqueue(next.map(({ match_type, value, outbound }) => ({ match_type, value, outbound })));
+    const handle = queue.enqueue({ rules: next.map(serializeRule), order: orderRef.current.split(",") });
     try {
       const saved = await handle.done;
       if (!queue.isCurrent(handle.revision) || batchEditRevision !== editRevision.current) return;
       applyRules(reconcileSavedDrafts(saved.rules ?? [], next));
       setOutbounds(saved.outbounds ?? []);
+      orderRef.current = normalizeOrder(saved.match_order ?? orderRef.current.split(","));
+      setMatchOrder(orderRef.current);
+      const applied = applyResult(saved);
       setSavedAt(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
       setPendingSave(false);
       setSelected(new Set());
@@ -545,11 +586,8 @@ export function RoutingPage() {
       setBatchOpen(false);
       notify(
         text("批量添加完成", "Batch added"),
-        text(
-          `新增 ${batchPreview.add_count} 条${replaceBatchConflicts && batchPreview.conflict_count > 0 ? `，更新 ${batchPreview.conflict_count} 条冲突规则` : ""}，跳过 ${batchPreview.duplicate_count} 条重复项${!replaceBatchConflicts && batchPreview.conflict_count > 0 ? `和 ${batchPreview.conflict_count} 条冲突项` : ""}。`,
-          `Added ${batchPreview.add_count}${replaceBatchConflicts && batchPreview.conflict_count > 0 ? ` and updated ${batchPreview.conflict_count} conflicts` : ""}; skipped ${batchPreview.duplicate_count} duplicates${!replaceBatchConflicts && batchPreview.conflict_count > 0 ? ` and ${batchPreview.conflict_count} conflicts` : ""}.`,
-        ),
-        "success",
+        applied.message,
+        applied.intent,
       );
     } catch (error) {
       if (queue.isCurrent(handle.revision) && batchEditRevision === editRevision.current) {
@@ -562,7 +600,7 @@ export function RoutingPage() {
         setBatchApplying(false);
       }
     }
-  }, [applyRules, batchPreview, batchType, notify, replaceBatchConflicts, text]);
+  }, [applyResult, applyRules, batchPreview, batchType, notify, replaceBatchConflicts, text]);
 
   const activeRules = useMemo(() => rules.filter((rule) => {
     if (rule.match_type !== activeType) return false;
@@ -577,7 +615,31 @@ export function RoutingPage() {
     return (outbounds ?? []).find((outbound) => outbound.id === id)?.label ?? id.replace(/^nic_/, "");
   }, [outbounds, t]);
 
+  const disableUnavailableRules = useCallback(async () => {
+    setCheckingOutbounds(true);
+    try {
+      const snapshot = await appServices.routing.snapshot();
+      setOutbounds(snapshot.outbounds ?? []);
+      const available = new Set((snapshot.outbounds ?? []).map((item) => item.id));
+      const targets = rulesRef.current.filter((rule) => !rule.disabled && rule.outbound.startsWith("nic_") && !available.has(rule.outbound));
+      // Use the normal validation and save queue so edits in flight cannot restore an old state.
+      targets.forEach((rule) => updateRule(rule.id, { disabled: true }));
+      notify(text("出口检查完成", "Egress check complete"), targets.length
+        ? text(`已禁用 ${targets.length} 条失效出口规则，校验完成后自动保存。可随时重新启用。`, `Disabled ${targets.length} unavailable-egress rules; changes save after validation. You can enable them again.`)
+        : text("没有需要禁用的失效出口规则。", "No unavailable-egress rules need disabling."));
+    } catch (error) {
+      notify(text("出口检查失败", "Egress check failed"), error instanceof Error ? error.message : String(error), "error");
+    } finally {
+      setCheckingOutbounds(false);
+    }
+  }, [notify, text, updateRule]);
+
   const columns: TableColumnDefinition<DraftRule>[] = useMemo(() => [
+    createTableColumn<DraftRule>({
+      columnId: "enabled",
+      renderHeaderCell: () => text("启用", "Enabled"),
+      renderCell: (item) => <Switch checked={!item.disabled} aria-label={text(`启用规则 ${item.value}`, `Enable rule ${item.value}`)} onChange={(_, data) => updateRule(item.id, { disabled: !data.checked })} />,
+    }),
     createTableColumn<DraftRule>({
       columnId: "value",
       renderHeaderCell: () => text("匹配值", "Match value"),
@@ -618,6 +680,7 @@ export function RoutingPage() {
         ? <span className="routing-rule-status is-validating"><Spinner size="tiny" />{text("校验中", "Validating")}</span>
         : item.error
           ? <span className="routing-rule-status is-error" title={item.error}><ErrorCircle16Regular /><span>{item.error}</span></span>
+          : item.disabled ? <span className="routing-rule-status">{text("已禁用", "Disabled")}</span>
           : <span className="routing-rule-status is-valid"><CheckmarkCircle16Regular />{text("有效", "Valid")}</span>,
     }),
   ], [outboundLabel, outbounds, t, text, updateRule]);
@@ -635,7 +698,6 @@ export function RoutingPage() {
 
   return (
     <main className="routing-page">
-      <AppToaster toasterId={toasterId} position="top-end" />
       <header className="routing-page-heading">
         <div>
           <span className="section-kicker">{t("routing_title")}</span>
@@ -657,17 +719,35 @@ export function RoutingPage() {
       </header>
 
       <div className="routing-notice-slot">
-        {engineRunningInTun && (
-          <MessageBar intent="warning">
+        {engineRuntime.mode !== "tun" ? (
+          <MessageBar intent="info">
             <MessageBarBody>{text(
-              "规则会立即保存，但当前 sing-box 不热重载路由；停止并重新启动聚合后生效。",
-              "Rules are saved immediately, but sing-box does not hot-reload routing. Stop and restart aggregation to apply them.",
+              "分流规则仅由 TUN 模式加载；当前系统代理流量不会根据这些规则切换出口。",
+              "Routing rules are loaded only in TUN mode; current system-proxy traffic does not switch egress based on these rules.",
             )}</MessageBarBody>
           </MessageBar>
-        )}
+        ) : (engineRuntime.phase === "running" || engineRuntime.phase === "degraded") ? (
+          <MessageBar intent={restartRequirement.required ? "warning" : "info"}>
+            <MessageBarBody>{restartRequirement.required
+              ? restartRequirement.reason === "enable_fakeip"
+                ? text(
+                    "规则已保存，但域名分流所需的 DNS 配置尚未启用；请重启聚合以完整生效。",
+                    "Rules are saved, but the DNS configuration required for domain routing is not active; restart aggregation for full effect.",
+                  )
+                : text(
+                    "规则已保存，但当前 TUN 配置无法完整加载这项更改；请重启聚合。",
+                    "Rules are saved, but the current TUN configuration cannot load this change completely; restart aggregation.",
+                  )
+              : text(
+                  "规则保存后会自动热更新；已有连接保持当前路径，新连接使用新规则。",
+                  "Saved rules are hot-reloaded automatically. Existing connections keep their current path; new connections use the updated rules.",
+                )}</MessageBarBody>
+          </MessageBar>
+        ) : null}
       </div>
 
       <GlassSurface className="routing-toolbar-surface" tone="secondary">
+        <div className="routing-type-bar">
         <TabList selectedValue={activeType} onTabSelect={(_, data) => {
           setActiveType(data.value as MatchType);
           setSelected(new Set());
@@ -676,6 +756,22 @@ export function RoutingPage() {
             <Tab key={type} value={type}>{matchLabels[type]} · {counts[type]}</Tab>
           ))}
         </TabList>
+        <div className="routing-order-control">
+          <span id="routing-order-label">{text("匹配顺序", "Match order")}</span>
+          <Dropdown aria-labelledby="routing-order-label" aria-describedby="routing-order-hint" size="small"
+            value={matchOrder.split(",").map((kind) => kind === "ip" ? "IP" : kind === "domain" ? text("域名", "Domain") : text("进程", "Process")).join(" → ")}
+            selectedOptions={[matchOrder]} disabled={loading || saving || batchApplying}
+            onOptionSelect={(_, data) => {
+              if (!data.optionValue) return;
+              orderRef.current = data.optionValue;
+              setMatchOrder(data.optionValue);
+              applyRules(rulesRef.current.map((rule) => ({ ...rule, priority: 2 - data.optionValue!.split(",").indexOf(rule.match_type) })), true);
+            }}>
+            {matchOrders.map((order) => <Option key={order} value={order}>{order.split(",").map((kind) => kind === "ip" ? "IP" : kind === "domain" ? text("域名", "Domain") : text("进程", "Process")).join(" → ")}</Option>)}
+          </Dropdown>
+          <span id="routing-order-hint">{text("从左到右优先", "Leftmost first")}</span>
+        </div>
+        </div>
         <div className="routing-add-row">
           <Input
             ref={addRuleInputRef}
@@ -708,16 +804,19 @@ export function RoutingPage() {
         <Toolbar className="routing-actions" aria-label={text("规则操作", "Rule actions")}>
           <SearchBox value={filter} placeholder={text("筛选当前类型", "Filter current type")} onChange={(_, data) => setFilter(data.value)} />
           <span>{text(`${activeRules.length} 条显示 · ${rules.length} 条总计`, `${activeRules.length} shown · ${rules.length} total`)}</span>
+          <div className="routing-action-buttons">
+          <ToolbarButton disabled={loading || checkingOutbounds} onClick={() => void disableUnavailableRules()}>{text(checkingOutbounds ? "正在检查出口…" : "一键禁用无效规则", checkingOutbounds ? "Checking egress…" : "Disable unavailable rules")}</ToolbarButton>
           <ToolbarButton icon={<Delete20Regular />} disabled={selected.size === 0} onClick={() => setDeleteOpen(true)}>
             {text(`删除选中 (${selected.size})`, `Delete selected (${selected.size})`)}
           </ToolbarButton>
           <ToolbarButton icon={<ArrowDownload20Regular />} onClick={() => void importRules()}>{text("导入备份", "Import backup")}</ToolbarButton>
           <ToolbarButton icon={<ArrowUpload20Regular />} onClick={() => void appServices.routing.exportRules(
-            rules.map(({ match_type, value, outbound }) => ({ match_type, value, outbound })),
+            rules.map(serializeRule), orderRef.current.split(","),
           ).then((path) => path && notify(text("导出完成", "Export complete"), path, "success")).catch((error) =>
             notify(text("导出失败", "Export failed"), error instanceof Error ? error.message : String(error), "error"))}>
             {text("导出 / 分享", "Export / Share")}
           </ToolbarButton>
+          </div>
         </Toolbar>
       </GlassSurface>
 
@@ -752,12 +851,7 @@ export function RoutingPage() {
             selectedItems={selected}
             onSelectionChange={(_, data) => setSelected(data.selectedItems)}
             sortable={false}
-            resizableColumns
-            columnSizingOptions={{
-              value: { minWidth: 280, defaultWidth: 520 },
-              outbound: { minWidth: 210, defaultWidth: 280 },
-              status: { minWidth: 140, defaultWidth: 170 },
-            }}
+
           >
             <DataGridHeader>
               <DataGridRow className="routing-grid-header" selectionCell={{ checkboxIndicator: { "aria-label": text("全选当前规则", "Select all current rules") } }}>
@@ -768,7 +862,7 @@ export function RoutingPage() {
               {({ item, rowId }) => (
                 <DataGridRow<DraftRule>
                   key={rowId}
-                  className={`routing-row${selected.has(rowId) ? " is-selected" : ""}${item.error ? " has-error" : ""}`}
+                  className={`routing-row${selected.has(rowId) ? " is-selected" : ""}${item.error ? " has-error" : ""}${item.disabled ? " is-disabled" : ""}`}
                   selectionCell={{ checkboxIndicator: { "aria-label": text(`选择 ${item.value}`, `Select ${item.value}`) } }}
                 >
                   {({ renderCell }) => <DataGridCell>{renderCell(item)}</DataGridCell>}

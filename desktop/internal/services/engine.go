@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -72,6 +73,7 @@ type connectionTelemetry struct {
 }
 
 type telemetryResult struct {
+	SteamCDN          SteamCDNStatus        `json:"steam_cdn"`
 	StartedAt         time.Time             `json:"started_at"`
 	SampledAt         time.Time             `json:"sampled_at"`
 	TCPProfile        string                `json:"tcp_profile,omitempty"`
@@ -133,10 +135,14 @@ type HostPrivilegeCompatibility struct {
 }
 
 type telemetrySample struct {
-	at       time.Time
-	down     int64
-	up       int64
-	adapters map[string][2]int64
+	startedAt    time.Time
+	at           time.Time
+	down         int64
+	up           int64
+	adapters     map[string][2]int64
+	downloadBPS  float64
+	uploadBPS    float64
+	adapterRates map[string][2]float64
 }
 
 type EngineService struct {
@@ -149,6 +155,7 @@ type EngineService struct {
 	logs                   *SupportLogStore
 	tun                    *TunService
 	last                   telemetrySample
+	lastCDNLog             time.Time
 	lastPerformanceLog     time.Time
 	lastTUNHealthCheck     time.Time
 	tunHealthFailures      int
@@ -178,6 +185,10 @@ type dnsFallbackEvent struct {
 type coreLogEvent struct {
 	Component string `json:"component"`
 	Message   string `json:"message"`
+}
+
+func shouldTakeOverSystemProxy(mode string, settings AppSettings) bool {
+	return mode == "proxy" && settings.SystemProxyTakeover
 }
 
 func NewEngineService(settings *SettingsService, adapters *AdapterService, logs ...*SupportLogStore) *EngineService {
@@ -407,6 +418,7 @@ func (s *EngineService) Snapshot() (EngineSnapshot, error) {
 	}
 	if status.Engine.State != "running" {
 		s.last = telemetrySample{}
+		s.lastCDNLog = time.Time{}
 		s.lastPerformanceLog = time.Time{}
 		s.mu.Unlock()
 		return snapshot, nil
@@ -416,33 +428,35 @@ func (s *EngineService) Snapshot() (EngineSnapshot, error) {
 	if err := s.client.Request(ctx, "engine.telemetry", map[string]any{"include_connections": false}, &telemetry); err != nil {
 		return EngineSnapshot{}, fmt.Errorf("读取聚合遥测失败：%w", err)
 	}
+	s.mu.Lock()
+	logCDN := s.logs != nil && telemetry.SteamCDN.Enabled && time.Since(s.lastCDNLog) >= 10*time.Second
+	if logCDN {
+		s.lastCDNLog = time.Now()
+	}
+	s.mu.Unlock()
+	if logCDN {
+		telemetry.SteamCDN.CoreVersion, telemetry.SteamCDN.CoreCommit = hello.EngineVersion, hello.Commit
+		telemetry.SteamCDN.ConfiguredMode = settings.Mode
+		telemetry.SteamCDN.Available = slices.Contains(hello.Capabilities, "steam_cdn.configure")
+		s.logs.RecordEvent("steam_cdn", "runtime", map[string]any{"status": telemetry.SteamCDN})
+	}
 	snapshot.SampledAt = telemetry.SampledAt
 	snapshot.TCPProfile = telemetry.TCPProfile
 	snapshot.Connections = telemetry.Total.Connections
 	snapshot.SessionBytes = telemetry.Total.BytesDown + telemetry.Total.BytesUp
 	s.mu.Lock()
-	elapsed := telemetry.SampledAt.Sub(s.last.at).Seconds()
-	if elapsed > 0 && elapsed < 30 {
-		snapshot.DownloadBPS = float64(max64(0, telemetry.Total.BytesDown-s.last.down)) / elapsed
-		snapshot.UploadBPS = float64(max64(0, telemetry.Total.BytesUp-s.last.up)) / elapsed
-	}
-	current := telemetrySample{
-		at: telemetry.SampledAt, down: telemetry.Total.BytesDown, up: telemetry.Total.BytesUp,
-		adapters: map[string][2]int64{},
-	}
+	s.last.update(telemetry)
+	snapshot.DownloadBPS = s.last.downloadBPS
+	snapshot.UploadBPS = s.last.uploadBPS
 	for _, item := range telemetry.Adapters {
 		runtime := AdapterRuntime{
 			ID: item.Name, Connections: item.Connections, BytesDown: item.BytesDown,
 			BytesUp: item.BytesUp, HealthState: item.HealthState,
 		}
-		if previous, ok := s.last.adapters[item.Name]; ok && elapsed > 0 && elapsed < 30 {
-			runtime.DownloadBPS = float64(max64(0, item.BytesDown-previous[0])) / elapsed
-			runtime.UploadBPS = float64(max64(0, item.BytesUp-previous[1])) / elapsed
-		}
-		current.adapters[item.Name] = [2]int64{item.BytesDown, item.BytesUp}
+		rates := s.last.adapterRates[item.Name]
+		runtime.DownloadBPS, runtime.UploadBPS = rates[0], rates[1]
 		snapshot.Adapters = append(snapshot.Adapters, runtime)
 	}
-	s.last = current
 	performanceNow := time.Now()
 	shouldLogPerformance := shouldRecordPerformance(
 		performanceNow,
@@ -621,6 +635,8 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		return EngineSnapshot{}, err
 	}
 	defer s.releaseLifecycle()
+	settings := s.settings.Get()
+	takeOverSystemProxy := shouldTakeOverSystemProxy(mode, settings)
 	s.mu.Lock()
 	if s.closing {
 		s.mu.Unlock()
@@ -631,7 +647,7 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		s.mu.Unlock()
 		return EngineSnapshot{}, fmt.Errorf("系统代理状态尚未安全恢复：%s", recoveryError)
 	}
-	if mode == "proxy" && s.hostElevated && !s.elevatedProxySafe {
+	if takeOverSystemProxy && s.hostElevated && !s.elevatedProxySafe {
 		detail := s.hostPrivilegeDetail
 		s.mu.Unlock()
 		if detail == "" {
@@ -663,12 +679,18 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 	if len(selected) == 0 {
 		return EngineSnapshot{}, errors.New("请至少选择一张活动网卡")
 	}
-	settings := s.settings.Get()
+	if err := validateAdapterSources(selected); err != nil {
+		return EngineSnapshot{}, err
+	}
 	routingRules := []RoutingRule{}
 	compatibility := compatibilityPlan{}
 	dnsEgress := tunDNSEgressDecision{}
 	if mode == "tun" {
-		routingRules, err = normalizeRulesStrict(settings.RoutingRules)
+		sourceRules := settings.RoutingRules
+		if validMatchOrder(settings.RoutingMatchOrder) {
+			sourceRules = rulesWithMatchOrder(sourceRules, settings.RoutingMatchOrder)
+		}
+		routingRules, err = normalizeRulesStrict(sourceRules)
 		if err != nil {
 			return EngineSnapshot{}, err
 		}
@@ -696,11 +718,12 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 			names = append(names, adapter.Name)
 		}
 		logOwned = s.logs.Start(mode, names, map[string]any{
-			"socks_port":      settings.SOCKSPort,
-			"http_port":       settings.HTTPPort,
-			"weighted":        settings.Weighted,
-			"dns_policy":      settings.DNSPolicy,
-			"dns_egress_mode": settings.DNSEgressMode,
+			"socks_port":            settings.SOCKSPort,
+			"http_port":             settings.HTTPPort,
+			"system_proxy_takeover": settings.SystemProxyTakeover,
+			"weighted":              settings.Weighted,
+			"dns_policy":            settings.DNSPolicy,
+			"dns_egress_mode":       settings.DNSEgressMode,
 		})
 		s.logs.RecordEvent("engine", "start_requested", map[string]any{
 			"mode": mode, "adapters": names,
@@ -771,6 +794,9 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		})
 		return EngineSnapshot{}, err
 	}
+	if settings.SteamCDNEnabled && !slices.Contains(hello.Capabilities, "steam_cdn.configure") {
+		return EngineSnapshot{}, errors.New("当前 Core 不支持 Steam 下载优选，请更新核心或关闭此功能")
+	}
 	s.recordStartStage("core_connected", map[string]any{
 		"version": hello.EngineVersion, "elevated": hello.Elevated,
 		"launcher": hello.Launcher, "fallback": hello.Fallback,
@@ -821,6 +847,7 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 			"cache_ttl_ms": 60000, "query_timeout_ms": 4000,
 		},
 		"adapters":                engineAdapters(selected),
+		"steam_cdn_enabled":       settings.SteamCDNEnabled,
 		"domain_isolation":        settings.BlockedDomainBypass,
 		"domain_isolation_expiry": settings.BlockedDomainExpiry,
 	}
@@ -895,8 +922,14 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		return EngineSnapshot{}, cause
 	}
 	if mode == "proxy" {
-		if err := enableSystemProxy(settings.HTTPPort, settings.SOCKSPort); err != nil {
-			return rollback(err)
+		if takeOverSystemProxy {
+			if err := enableSystemProxy(settings.HTTPPort, settings.SOCKSPort); err != nil {
+				return rollback(err)
+			}
+		} else if s.logs != nil {
+			s.logs.RecordEvent("system_proxy", "takeover_skipped", map[string]any{
+				"http_port": settings.HTTPPort, "socks_port": settings.SOCKSPort,
+			})
 		}
 	} else {
 		var dnsResult dnsResolveResult
@@ -906,8 +939,20 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		}, &dnsResult); err != nil {
 			return rollback(fmt.Errorf("TUN 启动前 DNS 验证失败：%w", err))
 		}
-		s.recordStartStage("dns_validated", nil)
+		s.recordStartStage("dns_validated", map[string]any{
+			"adapter": dnsEgress.Adapter.Name, "policy": effectiveDNSPolicy,
+			"transport": dnsResult.Transport, "server": dnsResult.Server,
+		})
+		tunAddress, addressErr := availableTunIPv4Address()
+		if addressErr != nil {
+			return rollback(addressErr)
+		}
+		if s.logs != nil {
+			s.logs.RecordEvent("tun_address", "selected", map[string]any{"ipv4": tunAddress})
+		}
 		configOptions := tunConfigOptions{
+			IPv4Address:   tunAddress,
+			Stack:         settings.TUNStack,
 			DNSPolicy:     effectiveDNSPolicy,
 			IPv6Available: selectedAdaptersHaveIPv6(selected),
 			ConfigName:    "sing-box.json",
@@ -954,6 +999,7 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 				"server":             dnsResult.Server,
 				"route_exclusions":   dnsBootstrapRouteExclusions(dnsResult),
 				"ipv6_available":     configOptions.IPv6Available,
+				"tun_stack":          configOptions.Stack,
 				"ipv4_fallback_file": ipv4FallbackPath,
 			})
 		}
@@ -1025,6 +1071,7 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 	}
 	s.mu.Lock()
 	s.last = telemetrySample{}
+	s.lastCDNLog = time.Time{}
 	s.lastPerformanceLog = time.Time{}
 	s.lastTUNHealthCheck = time.Now()
 	s.tunHealthFailures = 0
@@ -1104,6 +1151,14 @@ func (s *EngineService) Stop() (EngineSnapshot, error) {
 	hello, ensureErr := s.client.Ensure(ctx)
 	var firstError error
 	if ensureErr == nil {
+		if slices.Contains(hello.Capabilities, "steam_cdn.configure") && s.logs != nil {
+			var status SteamCDNStatus
+			if err := s.client.Request(ctx, "steam_cdn.configure", map[string]any{}, &status); err == nil {
+				status.CoreVersion, status.CoreCommit = hello.EngineVersion, hello.Commit
+				status.ConfiguredMode, status.Available = s.settings.Get().Mode, true
+				s.logs.RecordEvent("steam_cdn", "before_stop", map[string]any{"status": status})
+			}
+		}
 		var tunResult tunLifecycleResult
 		if err := s.client.Request(ctx, "tun.deactivate", nil, &tunResult); err != nil {
 			var remote *engineclient.RemoteError
@@ -1126,6 +1181,7 @@ func (s *EngineService) Stop() (EngineSnapshot, error) {
 	}
 	s.mu.Lock()
 	s.last = telemetrySample{}
+	s.lastCDNLog = time.Time{}
 	s.lastPerformanceLog = time.Time{}
 	s.clashAPI = clashAPIConfig{}
 	s.tunAggregationEndpoint = ""

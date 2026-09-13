@@ -10,12 +10,7 @@ import {
   Spinner,
   Tab,
   TabList,
-  Toast,
-  ToastBody,
-  ToastTitle,
   Tooltip,
-  useId,
-  useToastController,
 } from "@fluentui/react-components";
 import {
   ArrowSync20Regular,
@@ -26,7 +21,6 @@ import {
 } from "@fluentui/react-icons";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { GlassSurface } from "../components/material/GlassSurface";
-import { AppToaster } from "../components/AppToaster";
 import {
   appServices,
   type AdapterView,
@@ -42,6 +36,8 @@ import type { EnginePhase } from "../state/useEngineState";
 import { adapterListKey } from "../state/adapterRuntime";
 import { NATDetectionPage } from "./NATDetectionPage";
 import { isNATDetectionBlocked } from "./natDetectionPolicy";
+import type { HealthNoticeIntent } from "./healthNotice";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
 
 const isBrowserPreview = () => import.meta.env.DEV && !isDesktopRuntime();
 
@@ -122,8 +118,6 @@ export function HealthPage({
     dns: text("DNS 配置", "DNS configuration"),
     metric: text("路由跃点", "Route metric"),
   }), [text]);
-  const toasterId = useId("health-toaster");
-  const { dispatchToast } = useToastController(toasterId);
   const [adapters, setAdapters] = useState<AdapterView[]>([]);
   const [snapshot, setSnapshot] = useState<DiagnosticSnapshot>(emptySnapshot);
   const [loading, setLoading] = useState(true);
@@ -142,15 +136,15 @@ export function HealthPage({
   adapterRuntimeRef.current = adapterRuntime;
   enginePhaseRef.current = enginePhase;
 
-  const notify = useCallback((title: string, message: string, intent: "success" | "error" | "warning" = "error") => {
-    dispatchToast(
-      <Toast>
-        <ToastTitle>{title}</ToastTitle>
-        <ToastBody>{message}</ToastBody>
-      </Toast>,
-      { intent, timeout: 5000 },
-    );
-  }, [dispatchToast]);
+  const { notify: pushNotification } = useAppNotifications();
+  const notify = useCallback((title: string, message: string, intent: HealthNoticeIntent = "error") => {
+    pushNotification({
+      title,
+      message,
+      intent,
+      dedupeKey: `health:${intent}:${title}`,
+    });
+  }, [pushNotification]);
 
   const load = useCallback(async () => {
     const runtimeTask = enginePhaseRef.current === undefined
@@ -301,12 +295,21 @@ export function HealthPage({
       });
       window.setTimeout(() => {
         if (!mounted.current) return;
-        setSnapshot({
+        const final = {
           state: "completed", run_id: "browser-fixture", target_ip: "223.5.5.5",
           total: selected.length, completed: selected.length,
           results: selected.map(previewResult), started_at: new Date(Date.now() - 1500).toISOString(),
           completed_at: new Date().toISOString(),
-        });
+        } satisfies DiagnosticSnapshot;
+        setSnapshot(final);
+        notify(
+          text("网络体检完成", "Network diagnostics complete"),
+          text(
+            `已完成 ${final.completed} 张网卡的绑定链路检查。`,
+            `Bound-path checks completed for ${final.completed} adapters.`,
+          ),
+          "success",
+        );
       }, 850);
       return;
     }
@@ -380,7 +383,6 @@ export function HealthPage({
 
   return (
     <main className="health-page">
-      <AppToaster toasterId={toasterId} position="top-end" />
       <header className="health-heading">
         <div key={healthView} className="health-heading-copy">
           <span className="section-kicker">{healthView === "link"
@@ -532,9 +534,9 @@ export function HealthPage({
                   <div><strong>{result.name}</strong><span>{result.address} → {result.target_ip}</span></div>
                 </div>
                 <div className="health-metrics">
-                  <span><small>{text("丢包", "Loss")}</small><strong>{result.loss_rate}%</strong></span>
-                  <span><small>{text("平均延迟", "Average latency")}</small><strong>{result.avg_latency_ms} ms</strong></span>
-                  <span><small>{text("抖动", "Jitter")}</small><strong>{result.jitter_ms} ms</strong></span>
+                  <span><small>{text("ICMP 丢包", "ICMP loss")}</small><strong>{result.sent > 0 && result.loss_rate >= 0 ? `${result.loss_rate}%` : "—"}</strong></span>
+                  <span><small>{text("平均延迟", "Average latency")}</small><strong>{result.received > 0 ? `${result.avg_latency_ms} ms` : "—"}</strong></span>
+                  <span><small>{text("抖动", "Jitter")}</small><strong>{result.received > 1 ? `${result.jitter_ms} ms` : "—"}</strong></span>
                 </div>
                 <div className="health-result-summary">
                   <strong>{meta.description}</strong>

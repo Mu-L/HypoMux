@@ -15,6 +15,7 @@ import (
 )
 
 type Server struct {
+	cdn              *steamCDN
 	config           Config
 	tcpTuningMode    tcpTuningMode
 	scheduler        *scheduler
@@ -114,6 +115,7 @@ func (s *Server) Start() (Endpoints, error) {
 	}
 	resolver.SetFallbackHandler(s.dnsFallbackHandler)
 	s.resolver = resolver
+	s.cdn = newSteamCDN(s.ctx, s.config.SteamCDNEnabled)
 
 	if len(s.config.Channels) > 0 {
 		return s.startChannelListeners()
@@ -225,6 +227,7 @@ func (s *Server) Endpoints() Endpoints {
 func (s *Server) Snapshot(includeConnections bool) TelemetrySnapshot {
 	result := s.registry.Snapshot(includeConnections)
 	result.TCPProfile = s.tcpProfileName()
+	result.SteamCDN = s.cdn.snapshot()
 	health, quarantines := s.health.snapshot()
 	for index := range result.Adapters {
 		item := health[result.Adapters[index].Name]
@@ -376,6 +379,11 @@ func (s *Server) acceptLoop(listener net.Listener, protocol string, channel stri
 func (s *Server) handleClient(protocol string, client net.Conn, session *connection) {
 	defer s.wg.Done()
 	defer client.Close()
+	defer func() {
+		if session.cdnTrial {
+			s.cdn.releaseTrial(session.cdnKey, session.cdnGeneration)
+		}
+	}()
 	defer s.registry.Finish(session)
 
 	reader := bufio.NewReaderSize(client, 64*1024)
@@ -445,14 +453,26 @@ func (s *Server) dialDirectTCP(ctx context.Context, target string) (net.Conn, er
 }
 
 func (s *Server) relay(clientReader io.Reader, client net.Conn, upstream net.Conn, session *connection) {
+	if session.cdnObserver == nil {
+		session.cdnObserver = s.newSteamObserver(session)
+	}
+	defer session.cdnObserver.close()
+	if session.cdnKey.domain != "" {
+		s.cdn.trafficChange(session.cdnKey, session.cdnGeneration, 1, 0, false, session.cdnTrial)
+		defer s.cdn.trafficChange(session.cdnKey, session.cdnGeneration, -1, 0, false, session.cdnTrial)
+	}
 	var relay sync.WaitGroup
 	relay.Add(2)
 	go func() {
 		defer relay.Done()
 		pooled, buffer := acquireTCPRelayBuffer()
 		defer releaseTCPRelayBuffer(pooled)
+		var writer io.Writer = upstream
+		if session.cdnObserver != nil {
+			writer = steamObserverWriter{Writer: upstream, observer: session.cdnObserver, up: true}
+		}
 		_, _ = io.CopyBuffer(accountingWriter{
-			Writer: upstream,
+			Writer: writer,
 			add:    func(amount uint64) { s.registry.AddUp(session, amount) },
 		}, readerOnly{Reader: clientReader}, buffer)
 		closeWrite(upstream)
@@ -461,10 +481,62 @@ func (s *Server) relay(clientReader io.Reader, client net.Conn, upstream net.Con
 		defer relay.Done()
 		pooled, buffer := acquireTCPRelayBuffer()
 		defer releaseTCPRelayBuffer(pooled)
-		_, _ = io.CopyBuffer(accountingWriter{
-			Writer: client,
-			add:    func(amount uint64) { s.registry.AddDown(session, amount) },
+		sampleAt := time.Now()
+		var sampleBytes uint64
+		effectiveRecorded := false
+		var transferBytes uint64
+		var blocked time.Duration
+		var clientWriteFailed bool
+		observe := func() {
+			if session.cdnKey.domain != "" {
+				if blocked < time.Since(sampleAt)/2 {
+					s.cdn.observe(session.cdnKey, session.cdnGeneration, sampleBytes, time.Since(sampleAt))
+				} else {
+					s.cdn.note(session.cdnGeneration, session.cdnKey.domain, session.cdnKey.adapter, session.cdnKey.ip, "client_backpressure")
+				}
+				blocked = 0
+			}
+			sampleAt, sampleBytes = time.Now(), 0
+		}
+		defer observe()
+		var writer io.Writer = client
+		if session.cdnKey.domain != "" {
+			writer = steamTimedWriter{Writer: steamObserverWriter{Writer: client, observer: session.cdnObserver}, blocked: &blocked, failed: &clientWriteFailed}
+		}
+		_, copyErr := io.CopyBuffer(accountingWriter{
+			Writer: writer,
+			add: func(amount uint64) {
+				s.registry.AddDown(session, amount)
+				if session.cdnKey.domain != "" {
+					s.cdn.trafficChange(session.cdnKey, session.cdnGeneration, 0, amount, false, session.cdnTrial)
+					sampleBytes += amount
+					transferBytes += amount
+					if session.cdnTrial && !effectiveRecorded && transferBytes >= 64*1024 {
+						s.cdn.mu.Lock()
+						if s.cdn.generation == session.cdnGeneration {
+							s.cdn.effective++
+						}
+						s.cdn.mu.Unlock()
+						effectiveRecorded = true
+					}
+					if time.Since(sampleAt) >= time.Second {
+						observe()
+					}
+				}
+			},
 		}, upstream, buffer)
+		if session.cdnKey.domain != "" {
+			failed := steamUpstreamFailed(copyErr, clientWriteFailed, session.cdnResponseFailed) && session.cdnTrial
+			s.cdn.accountTransfer(session.cdnKey, session.cdnGeneration, 0, 0, session.cdnTrial, failed)
+			if clientWriteFailed {
+				s.cdn.note(session.cdnGeneration, session.cdnKey.domain, session.cdnKey.adapter, session.cdnKey.ip, "client_write_closed")
+			}
+			// A client cancellation is neither a successful transfer nor proof of
+			// CDN failure. Explicit invalid upstream responses still count.
+			if !clientWriteFailed || failed {
+				s.cdn.finishTransfer(session.cdnKey, session.cdnGeneration, transferBytes, failed)
+			}
+		}
 		closeWrite(client)
 	}()
 	relay.Wait()
@@ -492,4 +564,27 @@ func closeWrite(connection net.Conn) {
 
 func listenAddress(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+type steamTimedWriter struct {
+	io.Writer
+	blocked *time.Duration
+	failed  *bool
+}
+
+func steamUpstreamFailed(copyErr error, clientWriteFailed, responseFailed bool) bool {
+	return responseFailed || copyErr != nil && !clientWriteFailed
+}
+
+func (w steamTimedWriter) Write(p []byte) (int, error) {
+	start := time.Now()
+	n, e := w.Writer.Write(p)
+	if w.failed != nil && (e != nil || n != len(p)) {
+		*w.failed = true
+	}
+	elapsed := time.Since(start)
+	if elapsed > 20*time.Millisecond {
+		*w.blocked += elapsed
+	}
+	return n, e
 }

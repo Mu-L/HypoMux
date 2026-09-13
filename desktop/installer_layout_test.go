@@ -200,6 +200,33 @@ func TestInstallerClearsInheritedPowerShellModulePath(t *testing.T) {
 	}
 }
 
+func TestInstallerWindowsVersionCheckIsForwardCompatible(t *testing.T) {
+	data, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(data)
+	for _, required := range []string{
+		`ManifestSupportedOS Win10`,
+		`Function HypoMuxCheckPlatform`,
+		`Call HypoMuxCheckPlatform`,
+		`CurrentMajorVersionNumber`,
+		`CurrentBuildNumber`,
+		`IntCmp $0 10240 hypoMuxPlatformArchitecture hypoMuxPlatformUnsupportedWindows hypoMuxPlatformArchitecture`,
+		`${IsNativeAMD64}`,
+		`${IsNativeARM64}`,
+		`SetErrorLevel 64`,
+		`SetErrorLevel 65`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("forward-compatible Windows platform check is missing %q", required)
+		}
+	}
+	if strings.Contains(script, `!insertmacro wails.checkArchitecture`) {
+		t.Fatal("installer still delegates version rejection to the generated Wails macro")
+	}
+}
+
 func TestInstallerCoreShutdownBarrierIsPathScopedAndBounded(t *testing.T) {
 	data, err := os.ReadFile("build/windows/nsis/stop-core-for-upgrade.ps1")
 	if err != nil {
@@ -209,13 +236,37 @@ func TestInstallerCoreShutdownBarrierIsPathScopedAndBounded(t *testing.T) {
 	for _, required := range []string{
 		`[System.IO.Path]::GetFullPath($_.Path).Equals(`,
 		`[System.StringComparison]::OrdinalIgnoreCase`,
-		`Stop-Process -Id $process.Id -Force`,
-		`[System.IO.FileShare]::None`,
+		`Stop-Process -Id $process.Id -Force -ErrorAction Stop`,
+		`[System.IO.FileAccess]::Write`,
+		`[System.IO.FileShare]::Read -bor [System.IO.FileShare]::Delete`,
+		`exit 10`,
+		`exit 11`,
 		`[DateTime]::UtcNow -lt $deadline`,
 	} {
 		if !strings.Contains(script, required) {
 			t.Fatalf("Core shutdown barrier is missing safety guard %q", required)
 		}
+	}
+	if strings.Contains(script, `[System.IO.FileShare]::None`) {
+		t.Fatal("Core shutdown barrier still rejects harmless shared readers")
+	}
+
+	installerData, err := os.ReadFile("build/windows/nsis/project.nsi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installer := string(installerData)
+	for _, required := range []string{
+		`MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(CoreProcessStopFailed)" IDRETRY stopCoreProcessesRetry`,
+		`System::Call 'kernel32::CreateMutex(`,
+		`SetErrorLevel 66`,
+	} {
+		if !strings.Contains(installer, required) {
+			t.Fatalf("installer lock recovery is missing %q", required)
+		}
+	}
+	if count := strings.Count(installer, `!insertmacro HypoMuxEnsureSingleInstaller`); count != 2 {
+		t.Fatalf("installer and uninstaller must share the single-instance mutex, got %d calls", count)
 	}
 }
 
@@ -427,7 +478,7 @@ func TestReleaseTrustSmokeWorkflowIsReadOnly(t *testing.T) {
 }
 
 func TestVersionMetadataIsConsistent(t *testing.T) {
-	const version = "2.5.8"
+	const version = "2.6.0"
 	files := []string{
 		"Taskfile.yml",
 		"build/config.yml",
@@ -595,7 +646,7 @@ func TestHomeThroughputUsesLightweightFastTelemetryAndSynchronizedLayers(t *test
 	}
 	stateSource := string(stateData)
 	engineSource := string(engineData)
-	css := string(cssData)
+	css := strings.ReplaceAll(string(cssData), "\r\n", "\n")
 	for _, required := range []string{
 		`export const HOME_TELEMETRY_POLL_MS = 800`,
 		`}, HOME_TELEMETRY_POLL_MS);`,
@@ -712,7 +763,7 @@ func TestWindowsTaskManagerUsesProductName(t *testing.T) {
 			t.Fatalf("Windows version strings are missing language fallback %s", language)
 		}
 	}
-	if strings.Count(string(infoData), `"FileVersion": "2.5.8"`) != 2 {
+	if strings.Count(string(infoData), `"FileVersion": "2.6.0"`) != 2 {
 		t.Fatal("Windows neutral and en-US version tables must both expose FileVersion")
 	}
 }
@@ -758,6 +809,30 @@ func TestCardsUseThemeAccentHoverGlow(t *testing.T) {
 	}
 	if !strings.Contains(string(surfaceData), `glass-surface hm-card`) {
 		t.Fatal("shared card component does not opt into the hover glow")
+	}
+}
+
+func TestNotificationIslandKeepsWebViewBackdropSampling(t *testing.T) {
+	cssData, err := os.ReadFile("frontend/src/app.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	css := string(cssData)
+	for _, required := range []string{
+		`inset-inline: 0`,
+		`margin-inline: auto`,
+		`backdrop-filter: blur(28px) saturate(155%)`,
+		`.global-notification-frost::before`,
+		`var(--hm-wallpaper-background, var(--hm-system-background))`,
+		`.global-notification-region.is-leaving`,
+		`@keyframes dynamic-island-leave`,
+	} {
+		if !strings.Contains(css, required) {
+			t.Fatalf("notification island compositor-safe frosting is missing %q", required)
+		}
+	}
+	if strings.Contains(css, `clip-path: inset(0 42% round 22px)`) {
+		t.Fatal("notification island still uses the flashing clip-path entrance animation")
 	}
 }
 

@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.5.8-0078d4?style=flat-square" alt="Version 2.5.8">
+  <img src="https://img.shields.io/badge/Version-2.6.0-0078d4?style=flat-square" alt="Version 2.6.0">
   <img src="https://img.shields.io/badge/Core-Go-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
   <img src="https://img.shields.io/badge/Desktop-Wails%20v3-CB3837?style=flat-square" alt="Wails v3">
   <img src="https://img.shields.io/badge/UI-React%20%2B%20Fluent%20UI-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React and Fluent UI">
@@ -14,6 +14,8 @@
 </p>
 
 HypoMux 是一款面向 Windows 的开源多网卡聚合与分流工具。它把多连接下载任务分配到多张活动网卡，让有线网络、Wi-Fi、手机热点或 USB 网络共享能够同时承担流量。
+
+官方网站：[https://hypomux.com](https://hypomux.com)
 
 HypoMux 聚合的是多个独立连接，而不是把单条 TCP 连接拆成多路。因此，它尤其适合 Steam、IDM、游戏平台更新器、浏览器大文件下载等高并发场景；单连接任务的速度仍受该连接本身限制。
 
@@ -74,7 +76,7 @@ HypoMux 不收集、出售或上传个人数据及遥测信息。程序仅会在
 
 ## 核心功能
 
-- **系统代理模式**：启动本地 HTTP/HTTPS 与 SOCKS5 服务，并接管 Windows 系统代理。资源占用较低，适合遵循系统代理的下载器、游戏平台和浏览器。
+- **系统代理模式**：启动本地 HTTP/HTTPS 与 SOCKS5 服务；默认接管 Windows 系统代理，也可在设置中关闭接管、仅向下载器等手动配置的应用提供本地端口。资源占用较低，适合代理感知型应用。
 - **虚拟网卡模式**：通过 Wintun 与 sing-box 接管更广泛的系统流量，并结合 WFP、DNS 和路由规则完成精细分流。
 - **多网卡连接调度**：为每个新连接选择出站网卡，并使用源地址绑定与 `IP_UNICAST_IF` 将套接字固定到真实物理链路。
 - **高级路由规则**：按进程、域名、IP/CIDR 指定聚合、直连、以太网、Wi-Fi 或某张具体网卡。
@@ -86,7 +88,7 @@ HypoMux 不收集、出售或上传个人数据及遥测信息。程序仅会在
 
 | 模式 | 覆盖范围 | 权限与兼容性 | 推荐场景 |
 | --- | --- | --- | --- |
-| 系统代理 | 遵循 Windows 系统代理的应用 | 更轻量；不创建虚拟网卡 | IDM、浏览器、Steam 等代理感知型下载 |
+| 系统代理 | 遵循 Windows 系统代理的应用，或手动填写本地 HTTP/SOCKS5 端口的应用 | 更轻量；可关闭系统代理接管；不创建虚拟网卡 | IDM、浏览器、Steam 等代理感知型下载 |
 | 虚拟网卡 | 更广泛的 TCP/UDP 与非代理感知流量 | 需要 Core 服务、Wintun/WFP；不能与其他 TUN 同时接管默认路由 | 游戏平台下载、WeGame、复杂分流和全局接管 |
 
 ## 📢 重要提示与合规免责声明
@@ -250,6 +252,7 @@ HypoMux 是一个完全出于技术热情、由作者在业余时间独立开发
 #### ✨ 特别鸣谢
 
 <p align="center">
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="海心，特别鸣谢 ¥50" src="https://img.shields.io/static/v1?label=%E6%B5%B7%E5%BF%83&message=%C2%A550&color=DCD0FF&labelColor=E6E6FA&style=for-the-badge&logo=github-sponsors&logoColor=6A5ACD" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="匿名，特别鸣谢" src="https://img.shields.io/badge/%E5%8C%BF%E5%90%8D-%E7%BB%99%E7%8C%AB%E5%92%AA%E5%8F%91%E7%94%B5-DCD0FF?style=for-the-badge&logo=github-sponsors&logoColor=6A5ACD&labelColor=E6E6FA" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="匿名，特别鸣谢" src="https://img.shields.io/badge/%E5%8C%BF%E5%90%8D-%E7%BB%99%E7%8C%AB%E5%92%AA%E5%8F%91%E7%94%B5-DCD0FF?style=for-the-badge&logo=github-sponsors&logoColor=6A5ACD&labelColor=E6E6FA" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="六花 DY，特别鸣谢" src="https://img.shields.io/static/v1?label=%E5%85%AD%E8%8A%B1%20DY&message=%E7%BB%99%E7%8C%AB%E5%92%AA%E5%8F%91%E7%94%B5&color=DCD0FF&labelColor=E6E6FA&style=for-the-badge&logo=github-sponsors&logoColor=6A5ACD" /></a>
@@ -260,6 +263,9 @@ HypoMux 是一个完全出于技术热情、由作者在业余时间独立开发
 #### ☕ 咖啡支持
 
 <p align="center">
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="谅，咖啡支持 ¥5" src="https://img.shields.io/static/v1?label=%E8%B0%85&message=%C2%A55&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="匿名，咖啡支持 ¥5" src="https://img.shields.io/static/v1?label=%E5%8C%BF%E5%90%8D&message=%C2%A55&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="姜虞，咖啡支持 ¥6.66" src="https://img.shields.io/static/v1?label=%E5%A7%9C%E8%99%9E&message=%C2%A56.66&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="Shout_bb，咖啡支持 ¥6.66" src="https://img.shields.io/static/v1?label=Shout_bb&message=%C2%A56.66&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="鲸鱼，咖啡支持" src="https://img.shields.io/badge/%E9%B2%B8%E9%B1%BC-%E8%AF%B7%E5%96%9D%E5%92%96%E5%95%A1-orange?style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="匿名，咖啡支持" src="https://img.shields.io/badge/%E5%8C%BF%E5%90%8D-%E8%AF%B7%E5%96%9D%E5%92%96%E5%95%A1-orange?style=for-the-badge&logo=coffeescript&logoColor=white" /></a>

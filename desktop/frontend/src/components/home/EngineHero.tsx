@@ -1,4 +1,6 @@
-import { Badge, Button, Spinner, Switch, Tab, TabList } from "@fluentui/react-components";
+import { useId } from "react";
+import { getSchedulingStrategy, schedulingStrategies } from "./schedulingStrategies";
+import { Badge, Button, Spinner, Dropdown, Option, Tab, TabList } from "@fluentui/react-components";
 import {
   Navigation20Regular,
   Play20Filled,
@@ -22,6 +24,7 @@ export function EngineHero({
   weighted,
   socksPort,
   httpPort,
+  systemProxyTakeover,
   onModeChange,
   onWeightedChange,
   onToggle,
@@ -37,12 +40,17 @@ export function EngineHero({
   weighted: boolean;
   socksPort: number;
   httpPort: number;
+  systemProxyTakeover: boolean;
   onModeChange: (mode: EngineMode) => void;
   onWeightedChange: (value: boolean) => void;
   onToggle: () => void;
 }) {
   const { locale, t } = useI18n();
   const text = (zh: string, en: string) => locale === "en" ? en : zh;
+  const strategyId = useId();
+  const strategyHintId = useId();
+  const strategy = getSchedulingStrategy(weighted);
+  const language = locale === "en" ? "en" : "zh";
   const active = phase === "running" || phase === "degraded" || phase === "starting";
   const actionLabel = phase === "starting"
     ? text("正在启动", "Starting")
@@ -91,10 +99,15 @@ export function EngineHero({
         </TabList>
         <span key={mode} className="engine-mode-note motion-inline-swap">
           {mode === "proxy"
-            ? text(
-              `接管遵循 Windows 系统代理的应用流量 · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
-              `Manages apps that follow the Windows system proxy · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
-            )
+            ? systemProxyTakeover
+              ? text(
+                `接管遵循 Windows 系统代理的应用流量 · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
+                `Manages apps that follow the Windows system proxy · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
+              )
+              : text(
+                `仅开放本地代理端口，不修改 Windows 系统代理 · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
+                `Local proxy ports only; Windows system proxy is unchanged · HTTP ${httpPort} · SOCKS5 ${socksPort}`,
+              )
             : text(
               "启动前执行只读路由、WFP 与权限检查；系统级资源由独立 Go Core 管理",
               "Performs read-only route, WFP, and permission checks before start; system resources are managed by the independent Go Core.",
@@ -110,14 +123,30 @@ export function EngineHero({
           >
             <span key={phase} className="engine-action-label motion-inline-swap">{actionLabel}</span>
           </Button>
-          <Switch
-            className="weighted-switch"
-            checked={weighted}
-            disabled={transitioning || phase === "running" || phase === "degraded"}
-            onChange={(_, data) => onWeightedChange(data.checked)}
-            label={weighted ? text("权重调度", "Weighted") : text("轮询调度", "Round-robin")}
-          />
+          <div className="scheduling-selector">
+            <label htmlFor={strategyId}>{text("调度策略", "Scheduling strategy")}</label>
+            <Dropdown
+              className="scheduling-dropdown"
+              id={strategyId}
+              aria-describedby={strategyHintId}
+              value={strategy.label[language]}
+              selectedOptions={[strategy.id]}
+              disabled={transitioning || active}
+              onOptionSelect={(_, data) => {
+                const next = schedulingStrategies.find((item) => item.id === data.optionValue);
+                if (next) onWeightedChange(next.weighted);
+              }}
+            >
+              {schedulingStrategies.map((item) => (
+                <Option key={item.id} value={item.id}>{item.label[language]}</Option>
+              ))}
+            </Dropdown>
+          </div>
         </div>
+        <p id={strategyHintId} className="scheduling-hint">
+          {strategy.description[language]}
+          {(transitioning || active) && <> {text("停止聚合后可切换策略。", "Stop aggregation to change strategy.")}</>}
+        </p>
       </div>
       <ThroughputDisplay download={download} upload={upload} connections={connections} history={history} active={active} />
     </GlassSurface>

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Hypostasis-Cat/HypoMux/desktop/internal/services"
 )
@@ -114,7 +116,9 @@ func TestRunAutoStartAccelerationUpdatesTrayStatus(t *testing.T) {
 	settings.Mode = "proxy"
 	statuses := make([]string, 0, 2)
 	err := runAutoStartAcceleration(
+		context.Background(),
 		settings,
+		nil,
 		func(mode string) (services.EngineSnapshot, error) {
 			if mode != "proxy" {
 				t.Fatalf("unexpected startup mode: %s", mode)
@@ -135,7 +139,9 @@ func TestRunAutoStartAccelerationUpdatesTrayStatus(t *testing.T) {
 	statuses = statuses[:0]
 	expected := errors.New("startup failed")
 	err = runAutoStartAcceleration(
+		context.Background(),
 		settings,
+		nil,
 		func(string) (services.EngineSnapshot, error) { return services.EngineSnapshot{}, expected },
 		func(phase string, mode string) { statuses = append(statuses, phase+":"+mode) },
 	)
@@ -144,6 +150,102 @@ func TestRunAutoStartAccelerationUpdatesTrayStatus(t *testing.T) {
 	}
 	if len(statuses) != 2 || statuses[1] != "failed:proxy" {
 		t.Fatalf("startup failure did not reach the tray: %#v", statuses)
+	}
+}
+
+func TestRunAutoStartAccelerationWaitsForAdapters(t *testing.T) {
+	settings := services.DefaultSettings()
+	settings.Mode = "tun"
+	ready := false
+	started := false
+	statuses := make([]string, 0, 2)
+	err := runAutoStartAcceleration(
+		context.Background(),
+		settings,
+		func(context.Context) error {
+			if started {
+				t.Fatal("engine started before adapters became ready")
+			}
+			ready = true
+			return nil
+		},
+		func(mode string) (services.EngineSnapshot, error) {
+			if !ready {
+				t.Fatal("engine started before readiness check completed")
+			}
+			started = true
+			return services.EngineSnapshot{Phase: "running", Mode: mode}, nil
+		},
+		func(phase string, mode string) { statuses = append(statuses, phase+":"+mode) },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started || len(statuses) != 2 || statuses[0] != "starting:tun" || statuses[1] != "running:tun" {
+		t.Fatalf("unexpected automatic startup: started=%t statuses=%#v", started, statuses)
+	}
+}
+
+func TestRunAutoStartAccelerationReadinessTimeoutDoesNotStart(t *testing.T) {
+	settings := services.DefaultSettings()
+	settings.Mode = "proxy"
+	expected := context.DeadlineExceeded
+	started := false
+	statuses := []string{}
+	err := runAutoStartAcceleration(
+		context.Background(),
+		settings,
+		func(context.Context) error { return expected },
+		func(string) (services.EngineSnapshot, error) {
+			started = true
+			return services.EngineSnapshot{}, nil
+		},
+		func(phase string, mode string) { statuses = append(statuses, phase+":"+mode) },
+	)
+	if !errors.Is(err, expected) || started {
+		t.Fatalf("unexpected timeout result: err=%v started=%t", err, started)
+	}
+	if len(statuses) != 1 || statuses[0] != "failed:proxy" {
+		t.Fatalf("readiness failure did not reach the tray: %#v", statuses)
+	}
+}
+
+func TestWaitForSelectedAdaptersStartsAfterMissingAdapterAppears(t *testing.T) {
+	checks := 0
+	err := waitForSelectedAdapters(
+		context.Background(),
+		[]string{"Ethernet", "WLAN"},
+		time.Millisecond,
+		func() ([]services.AdapterView, error) {
+			checks++
+			adapters := []services.AdapterView{{ID: "Ethernet"}}
+			if checks >= 2 {
+				adapters = append(adapters, services.AdapterView{ID: "WLAN"})
+			}
+			return adapters, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checks != 2 {
+		t.Fatalf("adapter checks = %d, want 2", checks)
+	}
+}
+
+func TestWaitForSelectedAdaptersReportsMissingAdaptersAtDeadline(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := waitForSelectedAdapters(
+		ctx,
+		[]string{"WLAN", "Ethernet"},
+		time.Hour,
+		func() ([]services.AdapterView, error) {
+			return []services.AdapterView{{ID: "Ethernet"}}, nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "WLAN") {
+		t.Fatalf("unexpected wait error: %v", err)
 	}
 }
 
@@ -160,5 +262,78 @@ func TestShouldAutoStartAcceleration(t *testing.T) {
 	settings.Autostart = false
 	if shouldAutoStartAcceleration(true, settings) {
 		t.Fatal("acceleration must not auto-start when launch at startup is disabled")
+	}
+}
+
+func TestBootWiFiRequestWaitsForDHCPBeforeStarting(t *testing.T) {
+	calls, polls := 0, 0
+	err := waitForSelectedAdapters(context.Background(), []string{"WLAN"}, time.Millisecond,
+		func() ([]services.AdapterView, error) {
+			polls++
+			if calls < 1 {
+				t.Fatal("did not request a Wi-Fi connection")
+			}
+			if polls < 3 {
+				return nil, nil
+			}
+			return []services.AdapterView{{ID: "WLAN", Address: "192.0.2.1", Operational: true}}, nil
+		},
+		func(context.Context) error { calls++; return nil },
+	)
+	if err != nil || polls != 3 {
+		t.Fatalf("did not wait for an addressed adapter: polls=%d err=%v", polls, err)
+	}
+}
+
+func TestBootWiFiFailurePreservesUsefulReasonAndDoesNotStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	err := waitForSelectedAdapters(ctx, []string{"WLAN"}, time.Millisecond,
+		func() ([]services.AdapterView, error) { cancel(); return nil, nil },
+		func(context.Context) error { return errors.New("Wi-Fi disabled by policy") },
+	)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "disabled by policy") {
+		t.Fatalf("lost diagnosis: %v", err)
+	}
+}
+
+func TestBootWiFiCancellationDoesNotContinueWaiting(t *testing.T) {
+	err := waitForSelectedAdapters(context.Background(), []string{"WLAN"}, time.Hour,
+		func() ([]services.AdapterView, error) {
+			t.Fatal("continued after startup was disabled")
+			return nil, nil
+		},
+		func(context.Context) error { return context.Canceled },
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+}
+
+func TestPrepareBootWiFiHonorsLivePreferences(t *testing.T) {
+	expected := services.DefaultSettings()
+	expected.Autostart, expected.AutoStartEngine = true, true
+	expected.SelectedAdapterIDs = []string{"WLAN"}
+	current := expected
+	calls := 0
+	connect := func(context.Context, []string) error { calls++; return nil }
+	if err := prepareBootWiFi(context.Background(), expected, current, connect); err != nil || calls != 0 {
+		t.Fatal("disabled Wi-Fi feature made a connection request")
+	}
+	current.AutoConnectWiFi = true
+	if err := prepareBootWiFi(context.Background(), expected, current, connect); err != nil || calls != 1 {
+		t.Fatal("enabled Wi-Fi feature did not connect")
+	}
+	current.AutoConnectWiFi = false
+	if err := prepareBootWiFi(context.Background(), expected, current, connect); err != nil || calls != 1 {
+		t.Fatal("Wi-Fi requests continued after switch was turned off")
+	}
+	current.AutoStartEngine = false
+	if err := prepareBootWiFi(context.Background(), expected, current, connect); !errors.Is(err, context.Canceled) {
+		t.Fatal("startup continued after automatic acceleration was disabled")
+	}
+	current = expected
+	current.SelectedAdapterIDs = []string{"new-WLAN"}
+	if err := prepareBootWiFi(context.Background(), expected, current, connect); !errors.Is(err, context.Canceled) {
+		t.Fatal("startup continued with obsolete adapter selection")
 	}
 }

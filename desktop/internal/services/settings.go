@@ -21,19 +21,25 @@ const (
 )
 
 type AppSettings struct {
+	RoutingMatchOrder   []string              `json:"routing_match_order,omitempty"`
+	SteamCDNEnabled     bool                  `json:"steam_cdn_enabled"`
 	Mode                string                `json:"mode"`
 	Language            string                `json:"language"`
 	SOCKSPort           int                   `json:"socks_port"`
 	HTTPPort            int                   `json:"http_port"`
+	SystemProxyTakeover bool                  `json:"system_proxy_takeover"`
 	Weighted            bool                  `json:"weighted"`
 	StrictRoute         bool                  `json:"strict_route"`
+	TUNStack            string                `json:"tun_stack"`
 	WFPCompatibility    WFPCompatibilityState `json:"wfp_compatibility_state,omitempty"`
 	ForceTUNBypass      bool                  `json:"force_tun_connectivity_bypass"`
 	BlockedDomainBypass bool                  `json:"blocked_domain_bypass"`
 	BlockedDomainExpiry bool                  `json:"blocked_domain_expiry"`
 	CloseToTray         bool                  `json:"close_to_tray"`
+	HideVirtualAdapters bool                  `json:"hide_virtual_adapters"`
 	Autostart           bool                  `json:"autostart"`
 	AutoStartEngine     bool                  `json:"auto_start_engine"`
+	AutoConnectWiFi     bool                  `json:"auto_connect_wifi,omitempty"`
 	DNSServer           string                `json:"dns_server"`
 	DNSPolicy           string                `json:"dns_policy"`
 	DNSEgressMode       string                `json:"dns_egress_mode"`
@@ -55,9 +61,12 @@ func DefaultSettings() AppSettings {
 		Language:            "zh",
 		SOCKSPort:           10800,
 		HTTPPort:            10801,
+		SystemProxyTakeover: true,
 		StrictRoute:         true,
+		TUNStack:            "system",
 		BlockedDomainExpiry: true,
 		CloseToTray:         false,
+		HideVirtualAdapters: true,
 		DNSServer:           "223.5.5.5",
 		DNSPolicy:           "auto",
 		DNSEgressMode:       DNSEgressAuto,
@@ -72,6 +81,7 @@ type SettingsService struct {
 	settings         AppSettings
 	migration        ConfigMigrationStatus
 	loadErr          error
+	loadErrorPath    string
 	setAutostart     func(bool) error
 	autostartEnabled func() (bool, error)
 }
@@ -106,6 +116,16 @@ func (s *SettingsService) StartupError() error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.loadErr
+}
+
+// StartupErrorPath identifies the input that actually failed, including legacy migration.
+func (s *SettingsService) StartupErrorPath() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.loadErrorPath != "" {
+		return s.loadErrorPath
+	}
+	return s.path
 }
 
 func settingsDirectory() string {
@@ -202,6 +222,16 @@ func (s *SettingsService) RollbackLegacyMigration() (AppSettings, error) {
 		}
 		if err := json.Unmarshal(data, &restored); err != nil {
 			return AppSettings{}, fmt.Errorf("迁移前备份格式无效：%w", err)
+		}
+		var storedFields map[string]json.RawMessage
+		if err := json.Unmarshal(data, &storedFields); err != nil {
+			return AppSettings{}, fmt.Errorf("迁移前备份格式无效：%w", err)
+		}
+		if _, exists := storedFields["system_proxy_takeover"]; !exists {
+			restored.SystemProxyTakeover = DefaultSettings().SystemProxyTakeover
+		}
+		if _, exists := storedFields["hide_virtual_adapters"]; !exists {
+			restored.HideVirtualAdapters = true
 		}
 		if restored.DNSEgressMode == "" {
 			restored.DNSEgressMode = DNSEgressAuto
@@ -352,7 +382,8 @@ func (s *SettingsService) reload() error {
 		}
 		migrated, migrationErr := migrateLegacySettings(legacyData)
 		if migrationErr != nil {
-			return migrationErr
+			s.loadErrorPath = legacyPath
+			return fmt.Errorf("旧配置迁移未完成，原文件未修改；可修复下述配置，或备份并重命名此旧文件后使用默认设置启动：%w", migrationErr)
 		}
 		if err := s.commitLocked(migrated); err != nil {
 			return err
@@ -371,6 +402,19 @@ func (s *SettingsService) reload() error {
 		return fmt.Errorf("设置文件格式无效：%w", err)
 	}
 	defaults := DefaultSettings()
+	var storedFields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &storedFields); err != nil {
+		return fmt.Errorf("设置文件格式无效：%w", err)
+	}
+	// The option was introduced after proxy mode already took ownership by
+	// default. Preserve that behaviour for settings files written by older
+	// versions while still allowing an explicitly persisted false value.
+	if _, exists := storedFields["system_proxy_takeover"]; !exists {
+		loaded.SystemProxyTakeover = defaults.SystemProxyTakeover
+	}
+	if _, exists := storedFields["hide_virtual_adapters"]; !exists {
+		loaded.HideVirtualAdapters = defaults.HideVirtualAdapters
+	}
 	if loaded.Mode != "proxy" && loaded.Mode != "tun" {
 		loaded.Mode = defaults.Mode
 	}
@@ -388,6 +432,11 @@ func (s *SettingsService) reload() error {
 	}
 	if loaded.DNSEgressMode == "" {
 		loaded.DNSEgressMode = defaults.DNSEgressMode
+	}
+	if stack, err := normalizeTunStack(loaded.TUNStack); err == nil {
+		loaded.TUNStack = stack
+	} else {
+		loaded.TUNStack = defaults.TUNStack
 	}
 	loaded.DNSAdapterID = strings.TrimSpace(loaded.DNSAdapterID)
 	if loaded.Language != "zh" && loaded.Language != "en" {
@@ -517,6 +566,9 @@ func (s *SettingsService) ClearWFPCompatibilityFailure() error {
 }
 
 func validateSettings(value AppSettings) error {
+	if _, err := normalizeTunStack(value.TUNStack); err != nil {
+		return err
+	}
 	if value.Mode != "proxy" && value.Mode != "tun" {
 		return fmt.Errorf("不支持的运行模式：%s", value.Mode)
 	}
@@ -533,7 +585,7 @@ func validateSettings(value AppSettings) error {
 		return errors.New("HTTP 端口必须在 1–65534 之间")
 	}
 	if value.SOCKSPort == value.HTTPPort {
-		return errors.New("SOCKS5 与 HTTP 端口不能相同")
+		return fmt.Errorf("SOCKS5 与 HTTP 端口不能相同（socks_port=%d，http_port=%d）；请将两个端口设为不同值，例如 10800 和 10801", value.SOCKSPort, value.HTTPPort)
 	}
 	ip := net.ParseIP(value.DNSServer)
 	if ip == nil || ip.To4() == nil {
@@ -576,6 +628,11 @@ func (s *SettingsService) commitLocked(next AppSettings) error {
 		return fmt.Errorf("设置文件尚未成功加载，拒绝覆盖原文件：%w", s.loadErr)
 	}
 	next = cloneSettings(next)
+	stack, err := normalizeTunStack(next.TUNStack)
+	if err != nil {
+		return err
+	}
+	next.TUNStack = stack
 	if err := writeSettingsFile(s.path, next); err != nil {
 		return err
 	}
@@ -622,6 +679,7 @@ func writeSettingsFile(path string, settings AppSettings) error {
 }
 
 func cloneSettings(value AppSettings) AppSettings {
+	value.RoutingMatchOrder = append([]string(nil), value.RoutingMatchOrder...)
 	result := value
 	result.SelectedAdapterIDs = append([]string(nil), value.SelectedAdapterIDs...)
 	result.AdapterWeights = cloneWeights(value.AdapterWeights)

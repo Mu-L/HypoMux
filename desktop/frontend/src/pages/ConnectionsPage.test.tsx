@@ -1,23 +1,67 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+import type { PropsWithChildren, ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AppNotificationCenter, AppNotificationProvider } from "../components/notifications/AppNotifications";
 import type { ConnectionListSnapshot, ConnectionView } from "../platform/services";
 import type { HomeAdapter } from "../state/useEngineState";
-import { ConnectionsPage } from "./ConnectionsPage";
+import {
+  connectionRuleCandidates,
+  ConnectionsPage,
+  preferredConnectionRuleOutbound,
+} from "./ConnectionsPage";
 
 const mocks = vi.hoisted(() => ({
   connections: vi.fn(),
+  routingSnapshot: vi.fn(),
+  previewBatch: vi.fn(),
+  saveRules: vi.fn(),
 }));
 
 vi.mock("../platform/services", () => ({
-  appServices: { engine: { connections: mocks.connections } },
+  appServices: {
+    engine: { connections: mocks.connections },
+    routing: {
+      snapshot: mocks.routingSnapshot,
+      previewBatch: mocks.previewBatch,
+      save: mocks.saveRules,
+    },
+  },
   withServiceTimeout: <T,>(request: Promise<T>) => request,
 }));
 
 vi.mock("../i18n/i18n", () => ({
   useI18n: () => ({ locale: "en" }),
 }));
+
+const NotificationTestProvider = ({ children }: PropsWithChildren) => (
+  // Keep menu/dialog portals in the same Fluent context used by App.tsx.
+  <FluentProvider theme={webLightTheme}>
+    <AppNotificationProvider>
+      {children}
+      <AppNotificationCenter />
+    </AppNotificationProvider>
+  </FluentProvider>
+);
+
+const renderPage = (ui: ReactElement) => render(ui, { wrapper: NotificationTestProvider });
+
+const readyDialogAction = (dialog: HTMLElement, name: string) => waitFor(() => {
+  // Opening a menu item also closes its popup. Wait for the dialog to own
+  // focus, not just for the asynchronous rule preview to enable its button.
+  expect(dialog.contains(document.activeElement)).toBe(true);
+  expect(dialog.getAttribute("aria-hidden")).not.toBe("true");
+  const button = within(dialog).getByRole("button", { name });
+  expect(button.hasAttribute("disabled")).toBe(false);
+  return button;
+});
+
+const expectNotificationDetail = async (message: RegExp) => {
+  fireEvent.click(await screen.findByRole("button", { name: "Details" }));
+  expect(await screen.findByText(message)).not.toBeNull();
+};
 
 const connection = (overrides: Partial<ConnectionView>): ConnectionView => ({
   id: 1,
@@ -55,6 +99,7 @@ const connections: ConnectionView[] = [
 
 const snapshot: ConnectionListSnapshot = {
   phase: "running",
+  mode: "tun",
   sampled_at: "2026-08-24T01:03:00Z",
   connections,
 };
@@ -93,16 +138,49 @@ const adapterRuntime = [
 
 describe("ConnectionsPage interactions", () => {
   beforeEach(() => {
+    // jsdom has no layout: body bounds are zero and offsetParent is always
+    // null. Tabster therefore treats the whole document as hidden and can
+    // never activate a dialog through its first focusable button. Model a
+    // visible viewport while preserving hidden/detached element semantics.
+    vi.spyOn(document.body, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, 1280, 800));
+    vi.spyOn(HTMLElement.prototype, "offsetParent", "get").mockImplementation(function (this: HTMLElement) {
+      if (!this.isConnected || this === document.body || getComputedStyle(this).position === "fixed") return null;
+      for (let element: HTMLElement | null = this; element; element = element.parentElement) {
+        if (element.hidden || getComputedStyle(element).display === "none") return null;
+      }
+      return this.parentElement;
+    });
     mocks.connections.mockResolvedValue(snapshot);
+    mocks.routingSnapshot.mockResolvedValue({
+      rules: [{ match_type: "process", value: "Existing.exe", outbound: "direct" }],
+      outbounds: [
+        { id: "aggregation", label: "Aggregated" },
+        { id: "direct", label: "Direct / bypass" },
+        { id: "nic_Ethernet", label: "Ethernet" },
+      ],
+    });
+    mocks.previewBatch.mockResolvedValue({
+      items: [{
+        input: "ethernet.example",
+        status: "add",
+        rule: { match_type: "domain", value: "ethernet.example", outbound: "aggregation" },
+      }],
+      add_count: 1,
+      duplicate_count: 0,
+      conflict_count: 0,
+      invalid_count: 0,
+    });
+    mocks.saveRules.mockResolvedValue({ rules: [], outbounds: [], restart_required: false });
   });
 
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
     vi.clearAllMocks();
   });
 
   it("shows only the selected adapter with its shared live throughput", async () => {
-    render(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
 
     expect(await screen.findByText("ethernet.example")).not.toBeNull();
     expect(screen.queryByText("wifi.example")).toBeNull();
@@ -112,7 +190,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("shows and clears the adapter filter without clearing search", async () => {
-    render(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
     await screen.findByText("ethernet.example");
 
     const adapterFilter = screen.getByRole("group", { name: "Adapter filter" });
@@ -129,7 +207,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("preserves the egress policy when the adapter filter is cleared", async () => {
-    render(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage initialAdapter="Ethernet" adapterRuntime={adapterRuntime} />);
     await screen.findByText("ethernet.example");
 
     const egressFilter = screen.getByRole("combobox", { name: "Filter by egress policy" }) as HTMLButtonElement;
@@ -145,7 +223,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("clears the search query when adapter navigation advances", async () => {
-    const view = render(
+    const view = renderPage(
       <ConnectionsPage initialAdapter="" adapterRevision={1} adapterRuntime={adapterRuntime} />,
     );
     await screen.findByText("ethernet.example");
@@ -165,7 +243,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("reorders visible rows when a sortable column is clicked", async () => {
-    render(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
     await screen.findByText("ethernet.example");
 
     fireEvent.click(screen.getByRole("button", { name: "Sort Process ascending" }));
@@ -176,7 +254,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("uses natural defaults and exposes the active sort state", async () => {
-    render(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
     await screen.findByText("ethernet.example");
 
     const trafficSort = screen.getByRole("button", { name: "Sort Traffic descending" });
@@ -194,7 +272,7 @@ describe("ConnectionsPage interactions", () => {
   });
 
   it("only offers single-NIC routing when such connections exist", async () => {
-    render(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
     await screen.findByText("ethernet.example");
 
     fireEvent.click(screen.getByRole("combobox", { name: "Filter by egress policy" }));
@@ -213,10 +291,136 @@ describe("ConnectionsPage interactions", () => {
         }),
       ],
     });
-    render(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
     await screen.findByText("Pinned.exe");
 
     fireEvent.click(screen.getByRole("combobox", { name: "Filter by egress policy" }));
     expect(await screen.findByRole("option", { name: "Single-NIC routing" })).not.toBeNull();
+  });
+
+  it("quick-adds a domain rule from a connection context menu without dropping existing rules", async () => {
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    const row = (await screen.findByText("Zulu.exe")).closest("article");
+    expect(row).not.toBeNull();
+
+    fireEvent.contextMenu(row!);
+    expect(await screen.findByRole("menuitem", { name: /Add by process/ })).not.toBeNull();
+    expect(screen.getByRole("menuitem", { name: /Add by domain/ })).not.toBeNull();
+    expect(screen.getByRole("menuitem", { name: /Add by ip/i })).not.toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Quick add routing rule" })).toBeNull();
+    expect(screen.getByText("Quick add routing rule")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: /Add by domain/ }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText("ethernet.example")).not.toBeNull();
+    fireEvent.click(await readyDialogAction(dialog, "Add rule"));
+
+    await waitFor(() => expect(mocks.saveRules).toHaveBeenCalledWith([
+      { match_type: "process", value: "Existing.exe", outbound: "direct" },
+      { match_type: "domain", value: "ethernet.example", outbound: "aggregation" },
+    ]));
+    await expectNotificationDetail(/new connections take effect immediately/i);
+  });
+
+  it("explains that a quick-added rule is inactive for current system-proxy traffic", async () => {
+    mocks.connections.mockResolvedValue({ ...snapshot, mode: "proxy" });
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    const row = (await screen.findByText("Zulu.exe")).closest("article")!;
+
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Add by domain/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(await readyDialogAction(dialog, "Add rule"));
+
+    await expectNotificationDetail(/current system-proxy traffic will not switch egress/i);
+  });
+
+  it("asks for a restart when a quick-added domain rule needs FakeIP", async () => {
+    mocks.saveRules.mockResolvedValue({
+      rules: [],
+      outbounds: [],
+      restart_required: true,
+      restart_reason: "enable_fakeip",
+    });
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    const row = (await screen.findByText("Zulu.exe")).closest("article")!;
+
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Add by domain/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(await readyDialogAction(dialog, "Add rule"));
+
+    await expectNotificationDetail(/restart aggregation to enable the DNS configuration required for domain routing/i);
+  });
+
+  it("updates only the exact conflicting rule selected from a connection", async () => {
+    const existingRules = [
+      { match_type: "process", value: "Existing.exe", outbound: "direct" },
+      { match_type: "domain", value: "ethernet.example", outbound: "direct" },
+      { match_type: "domain", value: "other.example", outbound: "direct" },
+    ];
+    mocks.routingSnapshot.mockResolvedValue({
+      rules: existingRules,
+      outbounds: [
+        { id: "aggregation", label: "Aggregated" },
+        { id: "direct", label: "Direct / bypass" },
+      ],
+    });
+    mocks.previewBatch.mockResolvedValue({
+      items: [{
+        input: "ethernet.example",
+        status: "conflict",
+        rule: { match_type: "domain", value: "ethernet.example", outbound: "aggregation" },
+        existing_outbound: "direct",
+      }],
+      add_count: 0,
+      duplicate_count: 0,
+      conflict_count: 1,
+      invalid_count: 0,
+    });
+
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    const row = (await screen.findByText("Zulu.exe")).closest("article");
+    fireEvent.contextMenu(row!);
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Add by domain/ }));
+
+    const dialog = await screen.findByRole("dialog");
+    const updateButton = await readyDialogAction(dialog, "Update rule");
+    fireEvent.click(updateButton);
+
+    await waitFor(() => expect(mocks.saveRules).toHaveBeenCalledWith([
+      existingRules[0],
+      existingRules[2],
+      { match_type: "domain", value: "ethernet.example", outbound: "aggregation" },
+    ]));
+  });
+
+  it("derives only usable identities and preserves the current single-NIC egress", () => {
+    expect(connectionRuleCandidates(connection({ process: "", domain: "", remote_ip: "2001:db8::8" }))).toEqual([
+      { matchType: "ip", value: "2001:db8::8" },
+    ]);
+    expect(preferredConnectionRuleOutbound(
+      connection({ outbound: "adapter", outbound_detail: "Ethernet" }),
+      [
+        { id: "aggregation", label: "Aggregated" },
+        { id: "nic_Ethernet", label: "Ethernet" },
+      ],
+    )).toBe("nic_Ethernet");
+  });
+
+  it("keeps quick-rule dialogs accessible after repeated context-menu transitions", async () => {
+    renderPage(<ConnectionsPage adapterRuntime={adapterRuntime} />);
+    const row = (await screen.findByText("Zulu.exe")).closest("article")!;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      fireEvent.contextMenu(row);
+      fireEvent.click(await screen.findByRole("menuitem", { name: /Add by domain/ }));
+      const dialog = await screen.findByRole("dialog");
+      await readyDialogAction(dialog, "Add rule");
+      fireEvent.click(await readyDialogAction(dialog, "Cancel"));
+      // The exiting surface must keep its contents and dimensions until unmount.
+      expect(within(dialog).getByText("ethernet.example")).not.toBeNull();
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    }
+    expect(mocks.saveRules).not.toHaveBeenCalled();
   });
 });

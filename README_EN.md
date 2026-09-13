@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Version-2.5.8-0078d4?style=flat-square" alt="Version 2.5.8">
+  <img src="https://img.shields.io/badge/Version-2.6.0-0078d4?style=flat-square" alt="Version 2.6.0">
   <img src="https://img.shields.io/badge/Core-Go-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go">
   <img src="https://img.shields.io/badge/Desktop-Wails%20v3-CB3837?style=flat-square" alt="Wails v3">
   <img src="https://img.shields.io/badge/UI-React%20%2B%20Fluent%20UI-61DAFB?style=flat-square&logo=react&logoColor=black" alt="React and Fluent UI">
@@ -74,7 +74,7 @@ HypoMux does not collect, sell, or upload personal data or telemetry. The progra
 
 ## Core features
 
-- **System Proxy mode**: Starts local HTTP/HTTPS and SOCKS5 services and takes ownership of the Windows system proxy. It is lightweight and works with proxy-aware downloaders, launchers, and browsers.
+- **System Proxy mode**: Starts local HTTP/HTTPS and SOCKS5 services. It manages the Windows system proxy by default, or can leave Windows unchanged and expose only the local ports to manually configured downloaders and other apps. It is lightweight and works with proxy-aware software.
 - **Virtual NIC mode**: Uses Wintun and sing-box to capture a broader range of system traffic, with WFP, DNS, and routing rules for precise split tunneling.
 - **Per-connection adapter scheduling**: Selects an outbound adapter for each new connection, combining source-address binding with `IP_UNICAST_IF` to pin sockets to physical links.
 - **Advanced routing rules**: Route by process, domain, IP/CIDR, aggregation, direct connection, Ethernet, Wi-Fi, or one specific adapter.
@@ -86,7 +86,7 @@ HypoMux does not collect, sell, or upload personal data or telemetry. The progra
 
 | Mode | Coverage | Privileges and compatibility | Recommended use |
 | --- | --- | --- | --- |
-| System Proxy | Applications that honor the Windows system proxy | Lightweight; no virtual adapter | IDM, browsers, Steam, and other proxy-aware downloads |
+| System Proxy | Applications that honor the Windows system proxy or are configured with the local HTTP/SOCKS5 ports | Lightweight; optional system-proxy management; no virtual adapter | IDM, browsers, Steam, and other proxy-aware downloads |
 | Virtual NIC | Broader TCP/UDP and non-proxy-aware traffic | Requires the Core service and Wintun/WFP; cannot share the default route with another TUN | Game-launcher downloads, WeGame, advanced split routing, and broader capture |
 
 ## 📢 Important Notice & Compliance Disclaimer
@@ -260,6 +260,8 @@ Thanks to all supporters who have injected energy into HypoMux:
 #### ☕ Coffee Support
 
 <p align="center">
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="Liang, ¥5 coffee support" src="https://img.shields.io/static/v1?label=%E8%B0%85&message=%C2%A55&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
+  <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="Anonymous, ¥5 coffee support" src="https://img.shields.io/static/v1?label=Anonymous&message=%C2%A55&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="Shout_bb, ¥6.66 coffee support" src="https://img.shields.io/static/v1?label=Shout_bb&message=%C2%A56.66&color=orange&style=for-the-badge&logo=coffeescript&logoColor=white" /></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img src="https://img.shields.io/badge/Whale-%20Buy%20a%20Coffee-orange?style=for-the-badge&logo=coffeescript&logoColor=white" alt="Whale, coffee support"></a>
   <a href="https://github.com/Hypostasis-Cat/HypoMux"><img alt="Anonymous, coffee support" src="https://img.shields.io/badge/%E5%8C%BF%E5%90%8D-%E8%AF%B7%E5%96%9D%E5%92%96%E5%95%A1-orange?style=for-the-badge&logo=coffeescript&logoColor=white" /></a>

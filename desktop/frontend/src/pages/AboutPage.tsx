@@ -9,20 +9,16 @@ import {
   Image,
   Link,
   Spinner,
-  Toast,
-  ToastBody,
-  ToastTitle,
-  useId,
-  useToastController,
 } from "@fluentui/react-components";
 import {
   ArrowSync20Regular,
   Code20Regular,
+  Globe20Regular,
 } from "@fluentui/react-icons";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { GlassSurface } from "../components/material/GlassSurface";
-import { AppToaster } from "../components/AppToaster";
+import { useAppNotifications } from "../components/notifications/AppNotifications";
 import { desktopPlatform } from "../platform/desktop";
 import { appServices, type UpdateCheckResult } from "../platform/services";
 import { productInfo } from "../product";
@@ -76,8 +72,7 @@ export function AboutPage() {
   const updateDialogTitleRef = useRef<HTMLDivElement>(null);
   const updateDialogContentRef = useRef<HTMLDivElement>(null);
   const updateNotesRef = useRef<HTMLDivElement>(null);
-  const toasterId = useId("about-toaster");
-  const { dispatchToast } = useToastController(toasterId);
+  const { notify: pushNotification } = useAppNotifications();
 
   useLayoutEffect(() => {
     if (!updateDialogOpen) return;
@@ -86,6 +81,7 @@ export function AboutPage() {
     // release-note link is far down the Markdown, that focus can scroll both
     // the dialog content and its nested notes pane to the bottom. Anchor focus
     // at the title and reset both scroll containers before the frame is shown.
+    // The title must also be tabbable so Fluent's later autofocus keeps it here.
     updateDialogTitleRef.current?.focus({ preventScroll: true });
     if (updateDialogContentRef.current) {
       updateDialogContentRef.current.scrollTop = 0;
@@ -98,10 +94,7 @@ export function AboutPage() {
   }, [updateDialogOpen, update?.release.tag_name]);
 
   const notify = (title: string, body: string, intent: "success" | "error" | "info" = "info") => {
-    dispatchToast(
-      <Toast><ToastTitle>{title}</ToastTitle><ToastBody>{body}</ToastBody></Toast>,
-      { intent, timeout: 3600 },
-    );
+    pushNotification({ title, message: body, intent, dedupeKey: `about:${intent}:${title}` });
   };
 
   const checkForUpdates = async () => {
@@ -153,7 +146,6 @@ export function AboutPage() {
 
   return (
     <main className="about-page">
-      <AppToaster toasterId={toasterId} position="top-end" />
       <header className="page-heading">
         <div>
           <span className="section-kicker">{text("开源多链路加速器", "Open-source multi-link accelerator")}</span>
@@ -174,6 +166,9 @@ export function AboutPage() {
           </div>
           <p>{t("about_intro")}</p>
           <div className="about-actions">
+            <Button appearance="secondary" icon={<Globe20Regular />} onClick={() => desktopPlatform.openURL(productInfo.website)}>
+              {text("官方网站", "Website")}
+            </Button>
             <Button appearance="secondary" icon={<Code20Regular />} onClick={() => desktopPlatform.openURL(productInfo.repository)}>
               GitHub
             </Button>
@@ -234,7 +229,7 @@ export function AboutPage() {
       >
         <DialogSurface className="update-dialog">
           <DialogBody>
-            <DialogTitle ref={updateDialogTitleRef} tabIndex={-1}>{t("about_update_available_title")}</DialogTitle>
+            <DialogTitle ref={updateDialogTitleRef} tabIndex={0}>{t("about_update_available_title")}</DialogTitle>
             <DialogContent ref={updateDialogContentRef}>
               <p className="update-summary">
                 {text("当前版本", "Current version")}: v{update?.current_version}<br />
