@@ -31,6 +31,11 @@ const (
 	// coreTerminateWait bounds how long a failed launch waits for the core
 	// process to exit before giving up (see privilegedLauncher.Launch).
 	coreTerminateWait = 5 * time.Second
+	// sessionAuthTimeout bounds the wait for the core's authentication message
+	// when the caller's context carries no deadline. Launch must never wait
+	// indefinitely, and the reader goroutine must not depend on Close alone to
+	// wake it up.
+	sessionAuthTimeout = 30 * time.Second
 )
 
 var ErrElevationCancelled = errors.New("用户取消了管理员权限请求")
@@ -236,6 +241,17 @@ func connectAuthenticatedPipeServer(ctx context.Context, handle windows.Handle) 
 }
 
 func authenticateCore(ctx context.Context, connection *os.File, token string) error {
+	// The pipe handle is overlapped, so the deadline is honoured by the
+	// netpoller and ReadBytes below cannot block past it. Without this the
+	// goroutine's only escape is the Close in the ctx.Done() branch, and a Close
+	// that fails strands it for the lifetime of the process. If the handle ever
+	// turns out not to be pollable this is a no-op and behaviour is unchanged.
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		deadline = time.Now().Add(sessionAuthTimeout)
+	}
+	_ = connection.SetReadDeadline(deadline)
+
 	result := make(chan error, 1)
 	go func() {
 		reader := bufio.NewReaderSize(connection, maxSessionMessageBytes)

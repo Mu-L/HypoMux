@@ -195,14 +195,9 @@ func (c DNSStartConfig) ResolverConfig() dns.Config {
 }
 
 func (p EngineStartParams) ProxyConfig() proxy.Config {
-	domainIsolation := true
-	if p.DomainIsolation != nil {
-		domainIsolation = *p.DomainIsolation
-	}
-	domainIsolationExpiry := true
-	if p.DomainIsolationExpiry != nil {
-		domainIsolationExpiry = *p.DomainIsolationExpiry
-	}
+	// DomainIsolation and DomainIsolationExpiry stay nil when the client omits
+	// them: proxy.normalizeConfig owns the nil -> true default, and duplicating
+	// it here is how the two would drift apart.
 	return proxy.Config{
 		ListenHost:            p.ListenHost,
 		SOCKSPort:             p.SOCKSPort,
@@ -212,8 +207,8 @@ func (p EngineStartParams) ProxyConfig() proxy.Config {
 		Channels:              p.Channels,
 		ConnectTimeout:        time.Duration(p.ConnectTimeoutMS) * time.Millisecond,
 		DNS:                   p.DNS.ResolverConfig(),
-		DomainIsolation:       &domainIsolation,
-		DomainIsolationExpiry: &domainIsolationExpiry,
+		DomainIsolation:       p.DomainIsolation,
+		DomainIsolationExpiry: p.DomainIsolationExpiry,
 		DomainQuarantines:     append([]proxy.DomainQuarantineSeed(nil), p.DomainQuarantines...),
 	}
 }

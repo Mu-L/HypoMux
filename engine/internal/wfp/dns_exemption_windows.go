@@ -373,11 +373,14 @@ func (session *dnsSession) Close() error {
 	}
 	wfp := newAPI()
 	status, _, _ := wfp.engineClose.Call(uintptr(session.engine))
-	session.engine = 0
-	session.filterIDs = nil
 	if status != 0 {
+		// The session is still open. Keep the handle and filter IDs so a later
+		// Close can retry; clearing them here would strand both for the
+		// remaining lifetime of the process.
 		return fmt.Errorf("FwpmEngineClose0 failed (0x%08X)", uint32(status))
 	}
+	session.engine = 0
+	session.filterIDs = nil
 	return nil
 }
 

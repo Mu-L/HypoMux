@@ -56,3 +56,42 @@ func TestRuntimeRejectsInvalidTransition(t *testing.T) {
 		t.Fatalf("state changed after rejected transition: %q", got)
 	}
 }
+
+func TestRuntimeClampsStateChangedAtOnClockRollback(t *testing.T) {
+	base := time.Date(2026, 7, 29, 12, 0, 0, 0, time.UTC)
+	current := base
+	engineRuntime := New(func() time.Time { return current })
+
+	starting, err := engineRuntime.Transition(StateStarting, "test")
+	if err != nil {
+		t.Fatalf("transition to starting failed: %v", err)
+	}
+	if !starting.Current.StateChangedAt.Equal(base) {
+		t.Fatalf("starting timestamp = %v, want %v", starting.Current.StateChangedAt, base)
+	}
+
+	current = base.Add(-90 * time.Second)
+	rolled, err := engineRuntime.Transition(StateRunning, "test")
+	if err != nil {
+		t.Fatalf("transition to running failed: %v", err)
+	}
+	if rolled.Current.StateChangedAt.Before(starting.Current.StateChangedAt) {
+		t.Fatalf(
+			"timestamp regressed to %v after %v",
+			rolled.Current.StateChangedAt,
+			starting.Current.StateChangedAt,
+		)
+	}
+	if rolled.Current.Sequence != starting.Current.Sequence+1 {
+		t.Fatalf("sequence = %d, want %d", rolled.Current.Sequence, starting.Current.Sequence+1)
+	}
+
+	current = base.Add(time.Minute)
+	forward, err := engineRuntime.Transition(StateDegraded, "test")
+	if err != nil {
+		t.Fatalf("transition to degraded failed: %v", err)
+	}
+	if !forward.Current.StateChangedAt.Equal(base.Add(time.Minute)) {
+		t.Fatalf("forward timestamp = %v, want %v", forward.Current.StateChangedAt, base.Add(time.Minute))
+	}
+}

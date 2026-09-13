@@ -344,13 +344,9 @@ func (s *Supervisor) Stop(ctx context.Context) (Status, error) {
 	s.mu.Lock()
 	run := s.run
 	if run == nil {
-		accepted := s.status.State != StateStopped
 		s.status = Status{State: StateStopped}
 		status := s.status
 		s.mu.Unlock()
-		if accepted {
-			return status, nil
-		}
 		return status, nil
 	}
 	run.intentional.Store(true)
@@ -460,6 +456,9 @@ func (s *Supervisor) terminateRun(
 	ctx context.Context,
 ) error {
 	if run.containment != nil {
+		// Closing the job handle is what kills the process tree: the job is
+		// created with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE. cleanupRun closes it
+		// again as an idempotent safety net and is the call that reports errors.
 		_ = run.containment.Close()
 	}
 	if run.command.Process != nil {
