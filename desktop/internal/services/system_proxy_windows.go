@@ -33,7 +33,9 @@ func proxyMarkerPath() string {
 }
 
 func enableSystemProxy(httpPort int, socksPort int) error {
-	if _, err := restoreSystemProxyDetailed(); err != nil {
+	release := acquireProxySettingsLock()
+	defer release()
+	if _, err := restoreSystemProxyDetailedLocked(); err != nil {
 		return fmt.Errorf("启用代理前恢复上次状态失败：%w", err)
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsPath, registry.QUERY_VALUE|registry.SET_VALUE)
@@ -87,6 +89,15 @@ func restoreSystemProxy() error {
 }
 
 func restoreSystemProxyDetailed() (string, error) {
+	release := acquireProxySettingsLock()
+	defer release()
+	return restoreSystemProxyDetailedLocked()
+}
+
+// restoreSystemProxyDetailedLocked expects the caller to already hold the proxy
+// settings lock. enableSystemProxy calls it directly because it holds the lock
+// for the whole enable sequence.
+func restoreSystemProxyDetailedLocked() (string, error) {
 	data, err := os.ReadFile(proxyMarkerPath())
 	if os.IsNotExist(err) {
 		return "", nil

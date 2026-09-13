@@ -67,10 +67,16 @@ func (r *Runtime) Transition(next State, reason string) (StateChange, error) {
 		return StateChange{}, fmt.Errorf("invalid engine state transition %q -> %q", previous, next)
 	}
 
+	changedAt := r.now().UTC()
+	// A wall-clock step backwards (NTP correction, manual clock change) must not
+	// stamp a newer transition earlier than the one it follows.
+	if changedAt.Before(r.snapshot.StateChangedAt) {
+		changedAt = r.snapshot.StateChangedAt
+	}
 	r.snapshot = Snapshot{
 		State:          next,
 		Sequence:       r.snapshot.Sequence + 1,
-		StateChangedAt: r.now().UTC(),
+		StateChangedAt: changedAt,
 		Reason:         reason,
 	}
 	return StateChange{Previous: previous, Current: r.snapshot}, nil

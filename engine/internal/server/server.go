@@ -805,12 +805,18 @@ func (s *Server) stopProxyForHostExit() {
 }
 
 func (s *Server) closeDNSExemption() error {
-	if s.dnsExemption == nil {
+	current := s.dnsExemption
+	if current == nil {
 		return nil
 	}
-	current := s.dnsExemption
+	if err := current.Close(); err != nil {
+		// Close failed, so the session is still open. Keep the reference: every
+		// caller aborts on this error, and the next call retries the cleanup
+		// instead of stranding the WFP engine handle for the process lifetime.
+		return err
+	}
 	s.dnsExemption = nil
-	return current.Close()
+	return nil
 }
 
 func (s *Server) uptimeMilliseconds() int64 {

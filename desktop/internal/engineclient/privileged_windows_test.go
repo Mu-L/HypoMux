@@ -206,6 +206,43 @@ func TestAuthenticatedPipeRejectsUnexpectedClientPID(t *testing.T) {
 	}
 }
 
+func TestAuthenticatedPipeConnectionHonoursReadDeadline(t *testing.T) {
+	pipe, err := createAuthenticatedPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.close()
+
+	client := openTestPipe(t, pipe.name)
+	defer client.Close()
+
+	connectCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := connectAuthenticatedPipeServer(connectCtx, pipe.handle); err != nil {
+		t.Fatalf("accepting pipe connection: %v", err)
+	}
+
+	connection := os.NewFile(uintptr(pipe.handle), pipe.name)
+	if connection == nil {
+		t.Fatal("os.NewFile returned no connection")
+	}
+	pipe.handle = windows.InvalidHandle
+	defer connection.Close()
+
+	// authenticateCore relies on this deadline to wake its reader goroutine even
+	// when the Close on the ctx.Done() path fails.
+	if err := connection.SetReadDeadline(time.Now().Add(150 * time.Millisecond)); err != nil {
+		t.Fatalf("pipe connection does not support read deadlines: %v", err)
+	}
+	started := time.Now()
+	if _, err := connection.Read(make([]byte, 16)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("read returned %v, want %v", err, os.ErrDeadlineExceeded)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("deadline took %v to abort the blocked read", elapsed)
+	}
+}
+
 func openTestPipe(t *testing.T, name string) *os.File {
 	t.Helper()
 	namePointer, err := windows.UTF16PtrFromString(name)

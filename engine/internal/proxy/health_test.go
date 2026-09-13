@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"testing"
@@ -365,20 +366,16 @@ func TestServerSnapshotPublishesAdaptiveHealth(t *testing.T) {
 }
 
 func TestLocalConnectFailureClassification(t *testing.T) {
-	if !isLocalConnectFailure(syscall.Errno(10022)) {
-		t.Fatal("Windows disabled-socket error was not classified as local")
-	}
-	if !isLocalConnectFailure(syscall.Errno(10051)) {
-		t.Fatal("Windows network-unreachable error was not classified as local")
-	}
-	if !isLocalConnectFailure(syscall.Errno(1214)) {
-		t.Fatal("Windows disabled-interface error was not classified as local")
-	}
-	if isLocalConnectFailure(syscall.Errno(10061)) {
-		t.Fatal("remote connection refusal was classified as local")
+	if isLocalConnectFailure(nil) {
+		t.Fatal("absent failure was classified as local")
 	}
 	if isLocalConnectFailure(errors.New("plain failure")) {
 		t.Fatal("untyped failure was classified as local")
+	}
+	// Real dial failures arrive wrapped, so the unwrap path must keep working.
+	wrapped := &os.SyscallError{Syscall: "connect", Err: syscall.Errno(10061)}
+	if isLocalConnectFailure(wrapped) {
+		t.Fatal("remote connection refusal was classified as local")
 	}
 }
 

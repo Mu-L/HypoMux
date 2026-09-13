@@ -72,8 +72,12 @@ func (s *scheduler) selectWeighted(candidates []Adapter) Adapter {
 	total := 0
 	selected := candidates[0]
 	for _, adapter := range candidates {
-		total += adapter.Weight
-		s.currentWeight[adapter.Name] += adapter.Weight
+		weight := adapter.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		total += weight
+		s.currentWeight[adapter.Name] += weight
 		if s.currentWeight[adapter.Name] > s.currentWeight[selected.Name] {
 			selected = adapter
 		}

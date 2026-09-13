@@ -341,18 +341,5 @@ func isLocalConnectFailure(err error) bool {
 	if !errors.As(err, &errno) {
 		return false
 	}
-	switch uintptr(errno) {
-	// Windows WSAEINVAL, WSAEADDRNOTAVAIL, WSAENETDOWN, WSAENETUNREACH,
-	// WSAEHOSTUNREACH, ERROR_INVALID_NETNAME, ERROR_NETWORK_UNREACHABLE,
-	// ERROR_HOST_UNREACHABLE. Windows can report ERROR_INVALID_NETNAME when
-	// probing with ICMP and WSAEINVAL when dialing a socket that remains
-	// pinned to an interface that has just been disabled.
-	case 10022, 10049, 10050, 10051, 10065, 1214, 1231, 1232:
-		return true
-	// Common Unix/macOS equivalents used by Go unit and development builds.
-	case 49, 51, 64, 65, 99, 100, 101, 113:
-		return true
-	default:
-		return false
-	}
+	return isLocalConnectErrno(errno)
 }

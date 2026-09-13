@@ -803,11 +803,33 @@ func (s *EngineService) Start(mode string) (snapshot EngineSnapshot, returnErr e
 		"launch": s.client.LastLaunchReport(),
 	})
 	if settings.Mode != mode {
+		previousMode := settings.Mode
 		settings.Mode = mode
 		_, err = s.settings.UpdateHome(mode, settings.Weighted, settings.SelectedAdapterIDs, settings.AdapterWeights)
 		if err != nil {
 			return EngineSnapshot{}, err
 		}
+		// engine.status, engine.start, the system proxy, TUN activation and the
+		// connectivity probe can all still fail below. Leaving the requested mode
+		// persisted would make the next autostart retry a mode that never came
+		// up, so restore the previously working mode on any failure. This cannot
+		// live in rollback(): several failure paths return before it is defined.
+		defer func() {
+			if returnErr == nil {
+				return
+			}
+			// Re-read rather than reuse the captured settings: UpdateHome writes
+			// mode, weighting and adapter selection together, and the user may
+			// have changed the latter two while this start was in flight.
+			current := s.settings.Get()
+			if _, restoreErr := s.settings.UpdateHome(
+				previousMode, current.Weighted, current.SelectedAdapterIDs, current.AdapterWeights,
+			); restoreErr != nil && s.logs != nil {
+				s.logs.RecordEvent("engine", "mode_restore_failed", map[string]any{
+					"mode": previousMode, "message": restoreErr.Error(),
+				})
+			}
+		}()
 	}
 	var status engineStatusResult
 	if err := s.client.Request(ctx, "engine.status", nil, &status); err != nil {

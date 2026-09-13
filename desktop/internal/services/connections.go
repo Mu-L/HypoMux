@@ -43,7 +43,13 @@ func (s *EngineService) Connections() (ConnectionListSnapshot, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := s.client.Ensure(ctx); err != nil {
-		return ConnectionListSnapshot{}, err
+		// The page polls every 1.5s and turns any error into a toast, so an
+		// unreachable Core would flood the UI. The frontend already renders an
+		// "engine not running" empty state for every phase other than "running",
+		// which is the accurate reading when there is no Core to ask.
+		return ConnectionListSnapshot{
+			Phase: "stopped", SampledAt: time.Now(), Connections: []ConnectionView{},
+		}, nil
 	}
 	var status engineStatusResult
 	if err := s.client.Request(ctx, "engine.status", nil, &status); err != nil {

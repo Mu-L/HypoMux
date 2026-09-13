@@ -183,14 +183,22 @@ func (s *SettingsService) MigrateLegacy() (AppSettings, error) {
 	if err != nil {
 		return AppSettings{}, err
 	}
+	backup := ""
 	if current, readErr := os.ReadFile(s.path); readErr == nil {
-		backup := filepath.Join(settingsDirectory(), "settings.before-legacy-migration.json")
+		backup = filepath.Join(settingsDirectory(), "settings.before-legacy-migration.json")
 		if writeErr := os.WriteFile(backup, current, 0o600); writeErr != nil {
 			return AppSettings{}, fmt.Errorf("备份新版配置失败：%w", writeErr)
 		}
 		s.migration.BackupPath = backup
 	}
 	if err := s.commitLocked(migrated); err != nil {
+		// Applied stays false, so RollbackLegacyMigration would refuse this
+		// backup. Remove it instead of leaving an orphan, but never touch a
+		// backup that belongs to an earlier migration that did apply.
+		if backup != "" && !s.migration.Applied {
+			_ = os.Remove(backup)
+			s.migration.BackupPath = ""
+		}
 		return AppSettings{}, err
 	}
 	s.migration.LegacyFound = true
